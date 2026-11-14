@@ -6,7 +6,14 @@ name: Build ZN-M2 (LibWrt 25.12-nss / Linux 6.12.116 / NSS)
 # 包管理器：APK（上游 CONFIG_USE_APK default y，配置内嵌本文件并由防线一校验）
 # 产物：*-zn_m2-squashfs-sysupgrade.bin（唯一可刷）+ factory.ubi（救砖备用）
 # 与旧 6.18 包的区别：保留 qca-nss-drv / ecm / pppoe 全套卸载。
-# 网页版极简部署：本文件是唯一需要上传的文件。
+# 2026-11-14 第二版（用户定制）：
+#   - 内置定制页清单全部软件：iStore / ddns-go / acme / cpufreq / samba4 / upnp /
+#     tailscale / ttyd / irqbalance / Argon Light 主题 / kmod-tun / USB 存储 / ext4
+#   - OpenClash 只装「壳」（LuCI + 脚本），内核与数据库刷后从 U 盘备份恢复
+#   - CPU 编译期解锁 1.6/1.8GHz（放宽 OPP speedbin 位图）+ 可选开机定频
+#   - 首次开机把 LAN 预置为 192.168.9.1（避开光猫）
+#   - 保留 WiFi(ath11k+板级校准) / USB3.0 / 满血 NSS 11.4 / APK
+# 网页版极简部署：本文件仍是唯一需要上传的文件。
 # 只手动触发，不做定时编译。
 
 on:
@@ -24,7 +31,23 @@ on:
           - '12_5'
         default: '11_4'
       with_openclash:
-        description: '内置 OpenClash（若该 feed 导致编译失败，取消勾选后重跑）'
+        description: '内置 OpenClash 壳（LuCI+脚本；内核/节点/数据库刷后从备份恢复）'
+        type: boolean
+        default: true
+      with_istore:
+        description: '内置 iStore 应用商店（追加 linkease/istore feed）'
+        type: boolean
+        default: true
+      cpu_unlock_18:
+        description: '解锁 CPU 1.6/1.8GHz（编译期放宽 OPP speedbin 位图）'
+        type: boolean
+        default: true
+      cpu_lock_perf:
+        description: '开机自动定频 1.8GHz + performance（需同时勾选解锁）'
+        type: boolean
+        default: true
+      preset_lan:
+        description: '首次开机把 LAN 预置为 192.168.9.1'
         type: boolean
         default: true
       use_cache:
@@ -161,12 +184,59 @@ jobs:
           CONFIG_PACKAGE_luci-app-package-manager=y
           CONFIG_PACKAGE_luci-app-ttyd=y
           CONFIG_PACKAGE_luci-app-commands=y
-          
-          # ---- OpenClash ------------------------------------------------------------
-          # feed 由 workflow 动态追加（vernesong/OpenClash dev）。
-          # 若该 feed 在 APK/25.12 环境下编译失败，取消 workflow 的 with_openclash
-          # 勾选重跑，先拿一个干净可刷的固件，插件之后用 apk 单独装。
+
+          # ---- 用户定制清单（2026-11-14 openwrt.ai 定制页，逐项核实）----------------
+          # 定制页「定制软件包」文本框逐字转录：
+          #   luci-app-store luci-app-ddns-go luci-app-acme luci-app-cpufreq
+          #   luci-app-samba4 luci-app-upnp kmod-usb-storage kmod-fs-ext4
+          #   luci-app-ttyd luci-app-tailscale kmod-tun luci-app-irqbalance
+          # 按本分支实际 feed 校正（immortalwrt/luci @ openwrt-25.12）：
+          #   - luci-app-{acme,cpufreq,ddns-go,irqbalance,openclash,samba4,ttyd,upnp}
+          #     全部存在于 applications/ 目录，可直接选中。
+          #   - Tailscale 界面真名是 luci-app-tailscale-community；定制页写的
+          #     luci-app-tailscale 在本 feed 不存在，会被 defconfig 静默丢弃。
+          #   - luci-theme-argon 在 themes/ 目录（定制页勾选 Argon Light）。
+          #   - luci-app-store 不在两个自带 feed，由 workflow 追加 istore feed。
+          #   - kmod-usb-storage / kmod-fs-ext4 / luci-app-ttyd 已在上面 USB 段与
+          #     LuCI 段选中；kmod-tun 在下面补。
+          # 底层实现包由 luci-app-* 的 DEPENDS 自动带入；同时显式固化关键项，
+          # 避免上游依赖调整导致「界面在、功能没编进去」。
+          CONFIG_PACKAGE_luci-app-store=y
+          CONFIG_PACKAGE_luci-app-ddns-go=y
+          CONFIG_PACKAGE_ddns-go=y
+          CONFIG_PACKAGE_luci-app-acme=y
+          CONFIG_PACKAGE_acme-acmesh=y
+          CONFIG_PACKAGE_luci-app-cpufreq=y
+          CONFIG_PACKAGE_luci-app-samba4=y
+          CONFIG_PACKAGE_samba4-server=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_miniupnpd=y
+          CONFIG_PACKAGE_luci-app-tailscale-community=y
+          CONFIG_PACKAGE_tailscale=y
+          CONFIG_PACKAGE_luci-app-irqbalance=y
+          CONFIG_PACKAGE_irqbalance=y
+          # luci-app-ttyd 已在上面 LuCI 段选中，这里只补底层 ttyd
+          CONFIG_PACKAGE_ttyd=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_kmod-tun=y
+
+          # ---- 网络/存储杂项 --------------------------------------------------------
+          # UPnP 由上面 luci-app-upnp + miniupnpd 提供（nftables/Firewall4 版本，
+          # 与定制页「不勾 iptables 替换 Firewall4」保持一致）。
+          # IPv6 由 target 默认带入，无需额外开关。
+
+          # ---- OpenClash（只装壳）--------------------------------------------------
+          # 用户明确「openclash 先装个壳就行」：只把 LuCI 界面 + 管理脚本烤进固件，
+          # mihomo 内核 / Country.mmdb / GeoSite.dat / 节点池一律不烤，
+          # 刷机后从 U 盘备份恢复，既不让固件变大，也不依赖 GitHub 慢速下载。
+          # 关键改动：immortalwrt/luci @ openwrt-25.12 自带 luci-app-openclash，
+          # 因此不再追加 vernesong/OpenClash dev 第三方 feed —— 两个 feed 提供
+          # 同名包会让 feeds install 冲突，且第三方 feed 在 APK/25.12 下易编译失败。
+          # 顺带把 TProxy 需要的两个内核模块烤进去（旧固件就是卡在这两个装不上）。
           CONFIG_PACKAGE_luci-app-openclash=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
           
           # ---- NSS 满血数据面（本路线核心，全部显式写死防止被裁剪）----------------
           # 这些包全部由 25.12-nss 分支的 DEFAULT_PACKAGES / nss_packages feed 提供，
@@ -251,14 +321,23 @@ jobs:
           sed -i '/^CONFIG_NSS_FIRMWARE_VERSION_/d' "${OW}/.config"
           echo "CONFIG_NSS_FIRMWARE_VERSION_${NSS_FW}=y" >> "${OW}/.config"
           echo "NSS 固件选择: CONFIG_NSS_FIRMWARE_VERSION_${NSS_FW}=y"
-          if [ "${{ inputs.with_openclash }}" = "true" ]; then
-            echo "src-git openclash https://github.com/vernesong/OpenClash.git;dev" >> "${OW}/feeds.conf.default"
+          # iStore 不在 LibWrt 自带 feed；按官方 README 追加 istore feed。
+          # linkease/istore 会重定向到 istoreos/istore，git 能跟随重定向。
+          if [ "${{ inputs.with_istore }}" = "true" ]; then
+            echo '' >> "${OW}/feeds.conf.default"
+            echo 'src-git istore https://github.com/linkease/istore;main' >> "${OW}/feeds.conf.default"
           else
+            sed -i '/luci-app-store/d' "${OW}/.config"
+          fi
+          if [ "${{ inputs.with_openclash }}" != "true" ]; then
             sed -i '/luci-app-openclash/d' "${OW}/.config"
           fi
           cd "${OW}"
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          if [ "${{ inputs.with_istore }}" = "true" ]; then
+            ./scripts/feeds install -d y -p istore luci-app-store
+          fi
           make defconfig
 
       # 防线一：确认设备 / 文件系统 / NSS 关键包，不对就停工。
@@ -303,6 +382,80 @@ jobs:
             echo "::warning:: mango-dvk 也被选中；发布环节只取 zn_m2 文件"
           fi
 
+      # CPU 1.8GHz 解锁（编译期，唯一可行路径）：
+      # 主线 ipq6018.dtsi 把 1608/1800 两档写成 opp-supported-hw = <0x1>，
+      # 只有 eFuse speedbin=0 的芯片能用；本机 speedbin 非 0，qcom-cpufreq-nvmem
+      # 会过滤掉这两档。运行时 echo 1800000 被内核静默拒绝，configfs/DT-overlay
+      # 又没编进内核（KWRT 上实测），所以只能在编译期把位图放宽到 <0xf>。
+      - name: Unlock CPU 1.6/1.8GHz OPP
+        if: ${{ inputs.cpu_unlock_18 }}
+        run: |
+          set -eo pipefail
+          OW="${GITHUB_WORKSPACE}/openwrt"
+          cd "${OW}"
+          echo "=== 展开内核源码并应用 target patches ==="
+          make target/linux/prepare V=s 2>&1 | tail -25
+          DTS=$(find build_dir -path '*/arch/arm64/boot/dts/qcom/ipq6018.dtsi' -type f 2>/dev/null | head -n1)
+          [ -n "$DTS" ] || { echo "::error:: 找不到 ipq6018.dtsi，拒绝产出未解锁固件"; exit 1; }
+          echo "DTS = $DTS"
+          python3 - "$DTS" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p, encoding='utf-8').read()
+          total = 0
+          for hz in ('1608000000', '1800000000'):
+              pat = re.compile(r'(opp-' + hz + r'\s*\{[^}]*?opp-supported-hw\s*=\s*<0x)([0-9a-fA-F]+)(>)', re.S)
+              s, n = pat.subn(r'\g<1>f\g<3>', s)
+              print('  opp-%s: 位图放宽 %d 处' % (hz, n))
+              total += n
+          if total != 2:
+              sys.exit('::error:: 期望处理 2 个高频 OPP 档，实际 %d 个；拒绝产出未解锁固件' % total)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('已写入', p)
+          PY
+          echo "=== 复核 1.6G / 1.8G 档 ==="
+          grep -A5 -E 'opp-1608000000|opp-1800000000' "$DTS" | grep -E 'opp-|supported-hw|microvolt' || true
+          grep -q 'opp-supported-hw = <0xf>' "$DTS" || { echo "::error:: 位图放宽未生效"; exit 1; }
+          # 删掉可能已生成的 dtb，强制 kbuild 用新 dtsi 重编设备树
+          find build_dir -path '*/arch/arm64/boot/dts/qcom/*.dtb' -delete 2>/dev/null || true
+
+      # 首次开机预置（写进编译产物的 files/，不碰任何在用设备）：
+      # LAN 192.168.9.1 来自定制页；CPU 定频脚本仅在 1.8GHz 频点存在时才动作。
+      - name: Preset first-boot defaults
+        run: |
+          set -e
+          OW="${GITHUB_WORKSPACE}/openwrt"
+          mkdir -p "${OW}/files/etc/uci-defaults" "${OW}/files/etc/init.d" "${OW}/files/etc/rc.d"
+          if [ "${{ inputs.preset_lan }}" = "true" ]; then
+            cat > "${OW}/files/etc/uci-defaults/99-default-lan" <<'LAN_EOF'
+          #!/bin/sh
+          # 定制页指定后台地址 192.168.9.1；避开同网段的光猫管理地址，
+          # 也与刷机前备份里的 OpenClash / ddns-go / ACME 配置保持同一网段。
+          uci -q set network.lan.ipaddr='192.168.9.1'
+          uci -q commit network
+          exit 0
+          LAN_EOF
+            chmod 755 "${OW}/files/etc/uci-defaults/99-default-lan"
+          fi
+          if [ "${{ inputs.cpu_unlock_18 }}" = "true" ] && [ "${{ inputs.cpu_lock_perf }}" = "true" ]; then
+            cat > "${OW}/files/etc/init.d/cpu1800" <<'CPU_EOF'
+          #!/bin/sh /etc/rc.common
+          START=99
+          start() {
+              P=/sys/devices/system/cpu/cpufreq/policy0
+              [ -r "$P/scaling_available_frequencies" ] || return 0
+              grep -qw 1800000 "$P/scaling_available_frequencies" || return 0
+              echo performance > "$P/scaling_governor"
+              echo 1800000 > "$P/scaling_min_freq"
+              echo 1800000 > "$P/scaling_max_freq"
+          }
+          CPU_EOF
+            chmod 755 "${OW}/files/etc/init.d/cpu1800"
+            ln -sf ../init.d/cpu1800 "${OW}/files/etc/rc.d/S99cpu1800"
+          fi
+          echo "=== 注入的 files/ ==="
+          find "${OW}/files" -maxdepth 4 \( -type f -o -type l \) -print | sed "s#${OW}/##"
+
       - name: Build
         run: |
           cd "${GITHUB_WORKSPACE}/openwrt"
@@ -345,6 +498,22 @@ jobs:
           else
             echo "::warning:: 未能解析 tar 内的 root 成员，请在本地用 verify_firmware.py 复核"
           fi
+          echo "=== 内置软件复核（.manifest，缺失仅告警不阻断） ==="
+          MAN=$(ls "$BIN"/*.manifest 2>/dev/null | head -n1 || true)
+          if [ -n "$MAN" ]; then
+            for p in luci-app-openclash luci-app-store luci-app-upnp luci-app-samba4 \
+                     luci-app-ddns-go luci-app-acme luci-app-cpufreq \
+                     luci-app-tailscale-community luci-app-irqbalance luci-app-ttyd \
+                     luci-theme-argon kmod-tun kmod-usb3 kmod-ath11k; do
+              if grep -q "^${p} " "$MAN"; then
+                echo "  OK   $p"
+              else
+                echo "  ::warning:: 未内置 $p"
+              fi
+            done
+          else
+            echo "::warning:: 没找到 .manifest，跳过内置软件复核"
+          fi
           cd "${GITHUB_WORKSPACE}"
           sha256sum "$SYS" | tee sha256.txt
           COMMIT=$(cat source-commit.txt | cut -c1-9)
@@ -358,6 +527,19 @@ jobs:
             echo "包管理: APK（CONFIG_USE_APK=y，apk 3.0.5；命令 apk update/add/del）"
             echo "WiFi  : ath11k(AHB) + ath11k-firmware-ipq6018 + ipq-wifi-zn_m2 板级校准 + wpad-openssl；DTS &wifi okay"
             echo "USB3  : kmod-usb3/dwc3/dwc3-qcom + storage/uas；DTS &usb3 / &ssphy_0 / &qusb_phy_0 okay"
+            echo "内置包: iStore / OpenClash(仅壳) / ddns-go / acme / cpufreq / samba4 / upnp / tailscale / ttyd / irqbalance / Argon Light"
+            echo "OC壳  : 只含 LuCI+脚本；mihomo 内核 / GeoIP / 节点池刷后从备份恢复，未烤入固件"
+            if [ "${{ inputs.cpu_unlock_18 }}" = "true" ]; then
+              echo "CPU   : 1.6/1.8GHz OPP 位图 <0x1>→<0xf>（speedbin 解锁，最高 1.8GHz）"
+            else
+              echo "CPU   : 上游默认（最高 1.512GHz）"
+            fi
+            if [ "${{ inputs.cpu_lock_perf }}" = "true" ] && [ "${{ inputs.cpu_unlock_18 }}" = "true" ]; then
+              echo "定频  : 开机 performance + 1800000（/etc/init.d/cpu1800，可 disable）"
+            fi
+            if [ "${{ inputs.preset_lan }}" = "true" ]; then
+              echo "LAN   : 首次开机预置 192.168.9.1（uci-defaults）"
+            fi
             echo "设备  : qualcommax / ipq60xx / zn_m2 (NAND + UBI)"
             echo "文件  : $(basename "$SYS")"
             echo "大小  : ${SIZE} bytes ($((SIZE/1048576)) MiB)"
