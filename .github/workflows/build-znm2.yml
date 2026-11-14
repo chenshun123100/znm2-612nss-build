@@ -95,12 +95,36 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses-dev libssl-dev libelf-dev python3-setuptools \
-            python3-pip unzip zlib1g-dev zstd libzstd-dev file wget rsync patch \
-            vim-common ccache ecj libc6-dev-i386 libev-dev cpio bc
+          set -e
+          # GitHub 托管 runner 的 Ubuntu apt 镜像偶发 5xx / 解析失败：
+          # run #1 与 run #3 都在这一步以 exit 100 中止，而 run #2 用完全
+          # 相同的命令却顺利通过 —— 属于云端偶发，与固件配置无关。
+          # 给 update / install 各三次重试，并让 apt 对单次下载自身重试 5 次。
+          APTOPT="-o Acquire::Retries=5 -o Dpkg::Use-Pty=0"
+          for i in 1 2 3; do
+            if sudo DEBIAN_FRONTEND=noninteractive apt-get $APTOPT update; then break; fi
+            echo "::warning:: apt-get update 第 $i 次失败，稍后重试"
+            if [ "$i" -eq 3 ]; then echo "::error:: apt-get update 三次均失败"; exit 1; fi
+            sleep $((i * 10))
+          done
+          MUST="build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+                gettext git libncurses-dev libssl-dev libelf-dev python3-setuptools \
+                python3-pip unzip zlib1g-dev zstd libzstd-dev file wget rsync patch \
+                vim-common ccache cpio bc"
+          for i in 1 2 3; do
+            if sudo DEBIAN_FRONTEND=noninteractive apt-get $APTOPT install -y \
+                 --no-install-recommends $MUST; then break; fi
+            echo "::warning:: 必需依赖第 $i 次安装失败，稍后重试"
+            if [ "$i" -eq 3 ]; then echo "::error:: 必需依赖三次均失败"; exit 1; fi
+            sudo DEBIAN_FRONTEND=noninteractive apt-get $APTOPT update || true
+            sleep $((i * 10))
+          done
+          # 这三个包不是 Linux 6.12 / LibWrt 编译必需（ecj 只给 Java 包、
+          # libc6-dev-i386 给 32 位工具链、libev-dev 给个别用户态工具）；
+          # 源里偶尔缺也不阻断，避免一个包把整次编译卡死。
+          sudo DEBIAN_FRONTEND=noninteractive apt-get $APTOPT install -y \
+            --no-install-recommends ecj libc6-dev-i386 libev-dev \
+            || echo "::warning:: 可选依赖安装失败，继续（不影响本固件编译）"
           echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
 
       - name: Clone source and record version
@@ -418,7 +442,7 @@ jobs:
 
       # 无论防线一成功与否，都把展开后的 .config 留档，便于下次一次看全缺失项。
       - name: Upload defconfig for diagnosis
-        if: always()
+        if: ${{ always() && hashFiles('openwrt/.config') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: znm2-defconfig-run${{ github.run_number }}
