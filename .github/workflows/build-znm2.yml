@@ -1,0 +1,395 @@
+name: Build ZN-M2 (LibWrt 25.12-nss / Linux 6.12.116 / NSS)
+
+# 目标：兆能 ZN-M2 (zn,m2 / qualcommax-ipq60xx / 128MiB NAND + UBI)
+# 源码：LiBwrt/LibWrt 25.12-nss 分支 = Linux 6.12.116 + 满血 NSS 数据面
+# NSS 固件：11.4.0.5 Release 6（feed 默认值，与当前在用固件一致，支持 mesh）
+# 包管理器：APK（上游 CONFIG_USE_APK default y，配置内嵌本文件并由防线一校验）
+# 产物：*-zn_m2-squashfs-sysupgrade.bin（唯一可刷）+ factory.ubi（救砖备用）
+# 与旧 6.18 包的区别：保留 qca-nss-drv / ecm / pppoe 全套卸载。
+# 网页版极简部署：本文件是唯一需要上传的文件。
+# 只手动触发，不做定时编译。
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'LiBwrt/LibWrt 分支名（默认 25.12-nss = 6.12.116 + NSS）'
+        required: true
+        default: '25.12-nss'
+      nss_firmware:
+        description: 'NSS 固件版本（默认 11.4 = 上游默认及当前在用；12.5 不支持 802.11s mesh）'
+        type: choice
+        options:
+          - '11_4'
+          - '12_5'
+        default: '11_4'
+      with_openclash:
+        description: '内置 OpenClash（若该 feed 导致编译失败，取消勾选后重跑）'
+        type: boolean
+        default: true
+      use_cache:
+        description: '复用 dl / ccache 缓存'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-znm2-612nss
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      SOURCE_REF: ${{ inputs.source_ref }}
+      NSS_FW: ${{ inputs.nss_firmware }}
+    steps:
+      # 单文件版：设备/软件包配置已内嵌在下方 Prepare config 步骤，无需 Config/ 目录。
+      # 仍先扩盘再 checkout（扩盘会重新挂载 workspace）。
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Checkout CI repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev libelf-dev python3-setuptools \
+            python3-pip unzip zlib1g-dev zstd libzstd-dev file wget rsync patch \
+            vim-common ccache ecj libc6-dev-i386 libev-dev cpio bc
+          echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
+
+      - name: Clone source and record version
+        run: |
+          set -e
+          git clone --depth 1 --branch "$SOURCE_REF" \
+            https://github.com/LiBwrt/LibWrt openwrt
+          git -C openwrt rev-parse HEAD | tee "${GITHUB_WORKSPACE}/source-commit.txt"
+          echo "--- 内核版本证据 ---"
+          grep -E '^KERNEL_PATCHVER' openwrt/target/linux/qualcommax/Makefile || true
+          grep -R '^LINUX_VERSION-6.12' openwrt/target/linux/generic/kernel-6.12 || true
+          echo "--- zn_m2 设备定义 ---"
+          grep -A9 'define Device/zn_m2' openwrt/target/linux/qualcommax/image/ipq60xx.mk || true
+          echo "--- NSS 默认包（应含 drv / ecm / pppoe）---"
+          grep -E 'kmod-qca-nss-(drv|ecm|drv-pppoe)' openwrt/target/linux/qualcommax/Makefile || true
+
+      - name: Restore cache (dl + ccache)
+        if: ${{ inputs.use_cache }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            ${{ github.workspace }}/.ccache
+          key: znm2-612nss-${{ hashFiles('.github/workflows/build-znm2.yml') }}
+          restore-keys: znm2-612nss-
+
+      - name: Prepare config
+        run: |
+          set -e
+          OW="${GITHUB_WORKSPACE}/openwrt"
+          cat > "${OW}/.config" <<'ZNM2_SEED_EOF'
+          # ZN-M2 / qualcommax-ipq60xx / LibWrt 25.12-nss / Linux 6.12.116
+          # 满血 NSS 数据面 + squashfs-sysupgrade 构建种子
+          # 由 workflow 复制为 LibWrt/.config 后执行 make defconfig 展开。
+          # 增删包：改 CONFIG_PACKAGE_xxx=y 即可；不存在的包名会被 defconfig 静默忽略。
+          #
+          # 硬件基线（2026-11-14 只读核查）：zn,m2；128MiB ESMT SLC NAND；
+          # mtd16 rootfs 0x6080000=96.5MiB；ubi0 93.4MiB，kernel 5.3 / rootfs 49.8 /
+          # rootfs_data 35.4 MiB；cmdline 固定 ubi.mtd=rootfs rootfstype=squashfs。
+          # 因此只能出 squashfs-sysupgrade，绝不能开 ext4 根。
+          #
+          # 源码核实（LiBwrt/LibWrt @ 25.12-nss）：
+          #   - target/linux/generic/kernel-6.12 : LINUX_VERSION-6.12 = .116
+          #   - target/linux/qualcommax/Makefile : KERNEL_PATCHVER:=6.12，
+          #     DEFAULT_PACKAGES 直接列出全套 kmod-qca-nss-*
+          #   - target/linux/qualcommax/ipq60xx/target.mk :
+          #     DEFAULT_PACKAGES += ath11k-firmware-ipq6018 nss-firmware-ipq60xx kmod-qca-nss-crypto
+          #   - feeds.conf.default 自带 nss_packages (laipeng668/nss-packages;NSS-LibWrt)
+          #     与 sqm_scripts_nss，workflow 的 feeds install -a 会自动拉取
+          #   - config/Config-build.in : CONFIG_USE_APK default y（包管理器是 APK）
+          #   - image/ipq60xx.mk : define Device/zn_m2 用 FitImage + UbiFit，
+          #     BLOCKSIZE 128k / PAGESIZE 2048，与本机 NAND 完全一致
+          
+          # ---- Target ---------------------------------------------------------------
+          # LibWrt 的 scripts/target-metadata.pl 生成
+          # CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2（与 6.18 分支同一套符号体系）。
+          # 注意：只写 CONFIG_TARGET_DEVICE_*（旧 multi-profile 写法）会被 defconfig 丢弃，
+          # 落到 ipq60xx.mk 第一个设备 8devices_mango-dvk。
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq60xx=y
+          CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2=y
+          CONFIG_TARGET_PROFILE="DEVICE_zn_m2"
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          # CONFIG_TARGET_MULTI_PROFILE is not set
+          # CONFIG_TARGET_PER_DEVICE_ROOTFS is not set
+          
+          # ---- Build ----------------------------------------------------------------
+          CONFIG_CCACHE=y
+          CONFIG_DEVEL=y
+          CONFIG_BUILD_LOG=y
+          # 包管理器：上游 config/Config-build.in 第 71~74 行是
+          #   config USE_APK / imply PACKAGE_apk-openssl /
+          #   bool "Use APK instead of OPKG to build distribution" / default y
+          # 这里显式写死，避免上游默认值变动时静默编出 opkg 版固件；
+          # workflow 防线一会在 make defconfig 后校验这一项必须为 =y。
+          # 若确需编回 opkg：改成 "# CONFIG_USE_APK is not set"，源码层可行
+          # （package/system/opkg 仍在、target 层无强制），但 25.12 时代官方在线源
+          # 已是 .apk + packages.adb、没有 Packages.gz，后续装包生态不匹配，
+          # 且 README 的刷机清单与重建流程全部按 APK 编写 —— 不建议切。
+          CONFIG_USE_APK=y
+          
+          # ---- LuCI（本分支 USE_APK 默认 y，包管理器是 APK）------------------------
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_luci-app-package-manager=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-app-commands=y
+          
+          # ---- OpenClash ------------------------------------------------------------
+          # feed 由 workflow 动态追加（vernesong/OpenClash dev）。
+          # 若该 feed 在 APK/25.12 环境下编译失败，取消 workflow 的 with_openclash
+          # 勾选重跑，先拿一个干净可刷的固件，插件之后用 apk 单独装。
+          CONFIG_PACKAGE_luci-app-openclash=y
+          
+          # ---- NSS 满血数据面（本路线核心，全部显式写死防止被裁剪）----------------
+          # 这些包全部由 25.12-nss 分支的 DEFAULT_PACKAGES / nss_packages feed 提供，
+          # 不是 6.18 分支那套 nss-wifi-drv；workflow 会逐个校验它们必须为 =y。
+          CONFIG_PACKAGE_nss-firmware-ipq60xx=y
+          CONFIG_PACKAGE_kmod-qca-nss-drv=y
+          CONFIG_PACKAGE_kmod-qca-nss-ecm=y
+          CONFIG_PACKAGE_kmod-qca-nss-drv-pppoe=y
+          CONFIG_PACKAGE_kmod-qca-nss-dp=y
+          CONFIG_PACKAGE_kmod-qca-ssdk=y
+          CONFIG_PACKAGE_kmod-qca-nss-crypto=y
+          CONFIG_PACKAGE_kmod-nss-ifb=y
+          # 其余 bridge-mgr / vlan-mgr / wifi-meshmgr / gre / pptp / l2tpv2 / qdisc /
+          # map-t / vxlanmgr / tun6rd / tunipip6 / match / mirror / netlink / igs /
+          # lag-mgr / eogremgr 由 qualcommax/Makefile 的 DEFAULT_PACKAGES 自动带入，
+          # 不必逐条写（写了也只是重复）。
+          #
+          # 固件版本：nss_packages feed 的 choice 默认就是 11.4（11.4.0.5 Release 6），
+          # 这里显式写死 11_4，与上游默认、与当前在用固件保持一致，也支持 802.11s mesh。
+          # 源码依据：
+          #   - firmware/nss-firmware/Makefile 第 76 行 default NSS_FIRMWARE_VERSION_11_4
+          #   - qca-nss-drv/Makefile 在 CONFIG_NSS_FIRMWARE_VERSION_11_4=y 时，
+          #     把驱动源码切到 QSDK 11.4.0.5 / 2021-09-13 / patches-11.4，
+          #     与本机 kmod-qca-nss-drv 11.4.0.5.2021.09.13 完全一致。
+          # workflow 会按 dispatch 输入 nss_firmware 覆盖这一行（默认 11_4）。
+          # 需要 12.5 时手动选 12_5：会换用 QSDK 12.5 驱动源码并加编译宏，
+          # 且 12.5 / 12.2 / 12.1 均不支持 802.11s mesh，属本机未验证过的新组合。
+          CONFIG_NSS_FIRMWARE_VERSION_11_4=y
+          
+          # ---- 基础工具 -------------------------------------------------------------
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_ca-certificates=y
+          
+          # ---- WiFi 11ax（IPQ6018 / ath11k AHB，显式固化防止上游默认变动）----------
+          # 上游 target/linux/qualcommax/Makefile 的 DEFAULT_PACKAGES 已自带
+          # wpad-openssl + kmod-ath11k / -ahb / -pci；ipq60xx/target.mk 再补
+          # ath11k-firmware-ipq6018；image/ipq60xx.mk 的 zn_m2 设备还有
+          # DEVICE_PACKAGES := ipq-wifi-zn_m2（ZN-M2 板级校准 board-2.bin，缺了 WiFi 起不来）。
+          # 这里全部写死，workflow 防线一会逐个校验 =y。
+          # DTS：0906 补丁给 ipq6018.dtsi 加 wifi 节点；ipq6000-m2.dts 里
+          # &wifi status = "okay" + qcom,ath11k-calibration-variant = "ZN-M2"。
+          # 注：kmod-ath11k-pci 不写死——ZN M2 的 WiFi 走 AHB 总线，PCI 变体由
+          # 上游默认包带入即可，不把它列入必选防线。
+          CONFIG_PACKAGE_kmod-ath11k=y
+          CONFIG_PACKAGE_kmod-ath11k-ahb=y
+          CONFIG_PACKAGE_ath11k-firmware-ipq6018=y
+          CONFIG_PACKAGE_ipq-wifi-zn_m2=y
+          CONFIG_PACKAGE_wpad-openssl=y
+          
+          # ---- USB 3.0 + 存储（U 盘 / 后续安全 extroot 要用）------------------------
+          # DTS：ipq6000-cmiot.dtsi 引用 ipq6018-common.dtsi，后者已把
+          # &qusb_phy_0 / &qusb_phy_1 / &ssphy_0 / &usb2 / &usb3 全部 status = "okay"
+          # （主线 ipq6018.dtsi 里这些节点默认 disabled，靠这段启用，已专门复核）。
+          # config-6.12 里 CONFIG_PHY_QCOM_QMP_USB=y / CONFIG_PHY_QCOM_QUSB2=y 已内建。
+          CONFIG_PACKAGE_kmod-usb3=y
+          CONFIG_PACKAGE_kmod-usb-dwc3=y
+          CONFIG_PACKAGE_kmod-usb-dwc3-qcom=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_kmod-usb-storage-uas=y
+          CONFIG_PACKAGE_block-mount=y
+          CONFIG_PACKAGE_e2fsprogs=y
+          CONFIG_PACKAGE_kmod-fs-ext4=y
+          CONFIG_PACKAGE_kmod-fs-exfat=y
+          CONFIG_PACKAGE_kmod-fs-vfat=y
+          CONFIG_PACKAGE_kmod-fs-ntfs3=y
+          
+          # ---- 不要加的东西 ---------------------------------------------------------
+          # 1) 6.18 分支那套 nss-firmware / kmod-nss-wifi-drv 组合：本分支用的是
+          #    nss_packages feed 的 nss-firmware + 经典 qca-nss-drv/ecm，两套不通用。
+          # 2) 任何 ext4 / ubifs 根文件系统选项：本机 bootloader 只认 UBI squashfs。
+          # 3) 大插件集合：固件越大，rootfs 卷越大，留给 rootfs_data(overlay) 越小。
+          #    ubi0 总 93.4MiB，扣 kernel 后约 88MiB 是硬上限；建议固件尽量小。
+          # 4) 不要禁用上面 NSS 段里的任何包，否则 PPPoE/NAT 卸载会退回 CPU。
+          #
+          # 刷机后会清空的既有成果（需事后重建）：PPPoE 账号/密码（本机另存，勿上传）、
+          # LAN 网段、IPv6 PD、WAN 加固（dropbear/uhttpd 只绑 LAN）、
+          # OpenClash + 免费 TOP30 节点、ACME 证书、ddns-go、自研 LuCI 模块、
+          # U 盘挂载配置。包管理器也会从 opkg 换成 apk。
+          ZNM2_SEED_EOF
+          # NSS 固件版本由 dispatch 输入决定，先清掉 seed 里的默认项再写
+          sed -i '/^CONFIG_NSS_FIRMWARE_VERSION_/d' "${OW}/.config"
+          echo "CONFIG_NSS_FIRMWARE_VERSION_${NSS_FW}=y" >> "${OW}/.config"
+          echo "NSS 固件选择: CONFIG_NSS_FIRMWARE_VERSION_${NSS_FW}=y"
+          if [ "${{ inputs.with_openclash }}" = "true" ]; then
+            echo "src-git openclash https://github.com/vernesong/OpenClash.git;dev" >> "${OW}/feeds.conf.default"
+          else
+            sed -i '/luci-app-openclash/d' "${OW}/.config"
+          fi
+          cd "${OW}"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+
+      # 防线一：确认设备 / 文件系统 / NSS 关键包，不对就停工。
+      # LibWrt 的 target-metadata.pl 生成 CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2，
+      # 与 6.18 分支同一套符号体系；仍同时接受 multi-profile 写法以防分支变化。
+      - name: Verify target profile and NSS
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE}/openwrt"
+          echo "--- .config 中的 target 段 ---"
+          grep -E '^CONFIG_TARGET_(qualcommax|PROFILE|DEVICE|ROOTFS)' .config || true
+          grep -qE '^CONFIG_TARGET_(qualcommax_ipq60xx_DEVICE_zn_m2|DEVICE_qualcommax_ipq60xx_DEVICE_zn_m2)=y' .config || {
+            echo "::error:: zn_m2 设备未被选中，拒绝继续"; exit 1; }
+          if grep -q '^CONFIG_TARGET_PROFILE=' .config; then
+            grep -q '^CONFIG_TARGET_PROFILE="DEVICE_zn_m2"' .config || {
+              echo "::error:: CONFIG_TARGET_PROFILE 不是 DEVICE_zn_m2，会编成别的设备"; exit 1; }
+          fi
+          grep -q '^CONFIG_TARGET_ROOTFS_SQUASHFS=y' .config || {
+            echo "::error:: 未启用 squashfs，本机 NAND/UBI 刷不了"; exit 1; }
+          echo "--- 包管理器 ---"
+          grep -E '^CONFIG_USE_APK' .config || true
+          grep -q '^CONFIG_USE_APK=y' .config || {
+            echo "::error:: CONFIG_USE_APK 未启用；刷机清单与重建流程全部按 APK 编写，拒绝继续"; exit 1; }
+          echo "--- NSS 关键包（必须 =y）---"
+          grep -E '^CONFIG_PACKAGE_(kmod-qca-nss-drv|kmod-qca-nss-ecm|kmod-qca-nss-drv-pppoe|nss-firmware-ipq60xx)=' .config || true
+          for p in kmod-qca-nss-drv kmod-qca-nss-ecm kmod-qca-nss-drv-pppoe nss-firmware-ipq60xx; do
+            grep -q "^CONFIG_PACKAGE_${p}=y" .config || {
+              echo "::error:: NSS 关键包 ${p} 未被选中，会退化成纯 CPU 转发，拒绝继续"; exit 1; }
+          done
+          grep -q "^CONFIG_NSS_FIRMWARE_VERSION_${NSS_FW}=y" .config || {
+            echo "::error:: NSS 固件版本未选中或与 dispatch 输入 ${NSS_FW} 不一致（默认应为 11_4）"; exit 1; }
+          echo "--- WiFi / USB3 关键包（必须 =y）---"
+          grep -E '^CONFIG_PACKAGE_(kmod-ath11k|kmod-ath11k-ahb|ath11k-firmware-ipq6018|ipq-wifi-zn_m2|wpad-openssl|kmod-usb3|kmod-usb-dwc3|kmod-usb-dwc3-qcom|kmod-usb-storage|kmod-usb-storage-uas)=' .config || true
+          for p in kmod-ath11k kmod-ath11k-ahb ath11k-firmware-ipq6018 ipq-wifi-zn_m2 wpad-openssl \
+                   kmod-usb3 kmod-usb-dwc3 kmod-usb-dwc3-qcom kmod-usb-storage kmod-usb-storage-uas; do
+            grep -q "^CONFIG_PACKAGE_${p}=y" .config || {
+              echo "::error:: WiFi/USB3 关键包 ${p} 未被选中，拒绝继续（要求带 WiFi + USB3 支持）"; exit 1; }
+          done
+          echo "--- 实际选中的 NSS 固件版本 ---"
+          grep -E '^CONFIG_NSS_FIRMWARE_VERSION_' .config || true
+          if grep -q '^CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_8devices_mango-dvk=y' .config; then
+            echo "::warning:: mango-dvk 也被选中；发布环节只取 zn_m2 文件"
+          fi
+
+      - name: Build
+        run: |
+          cd "${GITHUB_WORKSPACE}/openwrt"
+          make -j"$(nproc)" || make -j1 V=s
+
+      # 防线二：必须有 zn_m2 的 squashfs-sysupgrade，且 root 卷不超过
+      # UBI 硬上限（ubi0 93.4MiB 扣 kernel ~5.3MiB ≈ 88MiB），否则拒绝发布。
+      - name: Verify firmware (device / fs / size)
+        id: verify
+        run: |
+          set -e
+          BIN="${GITHUB_WORKSPACE}/openwrt/bin/targets/qualcommax/ipq60xx"
+          echo "--- 产物列表 ---"
+          ls -lh "$BIN"
+          SYS=$(ls "$BIN"/*zn_m2*squashfs-sysupgrade.bin 2>/dev/null | head -n1 || true)
+          if [ -z "$SYS" ]; then
+            echo "::error:: 没找到 *zn_m2*squashfs-sysupgrade.bin，拒绝发布（很可能编成了别的设备）"
+            exit 1
+          fi
+          SIZE=$(stat -c%s "$SYS")
+          echo "file=$(basename "$SYS")" >> "$GITHUB_OUTPUT"
+          echo "固件: $(basename "$SYS")  ${SIZE} bytes = $((SIZE/1048576)) MiB"
+          if [ "$SIZE" -gt 92274688 ]; then
+            echo "::error:: 固件超过 88 MiB UBI 硬上限"; exit 1
+          fi
+          ROOTMEMBER=$(tar tf "$SYS" 2>/dev/null | grep -m1 '/root$' || true)
+          ROOTLEN=0
+          if [ -n "$ROOTMEMBER" ]; then
+            ROOTLEN=$(tar xOf "$SYS" "$ROOTMEMBER" 2>/dev/null | wc -c)
+            echo "root 成员: ${ROOTLEN} bytes = $((ROOTLEN/1048576)) MiB"
+            if [ "$ROOTLEN" -gt 92274688 ]; then
+              echo "::error:: root 卷超过 88 MiB，刷写时 ubimkvol 会失败并变砖"; exit 1
+            fi
+            MAGIC=$(tar xOf "$SYS" "$ROOTMEMBER" 2>/dev/null | dd bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            echo "root magic: $MAGIC (期望 68737173 = squashfs)"
+            if [ -z "$MAGIC" ] || [ "$MAGIC" != "68737173" ]; then
+              echo "::error:: root 不是 squashfs（或无法识别），本机 NAND/UBI 只认 squashfs-sysupgrade，拒绝发布"
+              exit 1
+            fi
+          else
+            echo "::warning:: 未能解析 tar 内的 root 成员，请在本地用 verify_firmware.py 复核"
+          fi
+          cd "${GITHUB_WORKSPACE}"
+          sha256sum "$SYS" | tee sha256.txt
+          COMMIT=$(cat source-commit.txt | cut -c1-9)
+          KLINE=$(grep -R '^LINUX_VERSION-6.12' openwrt/target/linux/generic/kernel-6.12 | head -n1 || true)
+          {
+            echo "ZN-M2 固件构建报告"
+            echo "源码  : LiBwrt/LibWrt @ ${SOURCE_REF} / ${COMMIT}"
+            echo "内核  : ${KLINE:-Linux 6.12.x}"
+            echo "NSS   : 固件 ${NSS_FW}（11_4 时驱动源码为 QSDK 11.4.0.5 / patches-11.4，与当前在用一致）"
+            echo "NSS包 : kmod-qca-nss-drv / ecm / drv-pppoe / dp / ssdk 全套"
+            echo "包管理: APK（CONFIG_USE_APK=y，apk 3.0.5；命令 apk update/add/del）"
+            echo "WiFi  : ath11k(AHB) + ath11k-firmware-ipq6018 + ipq-wifi-zn_m2 板级校准 + wpad-openssl；DTS &wifi okay"
+            echo "USB3  : kmod-usb3/dwc3/dwc3-qcom + storage/uas；DTS &usb3 / &ssphy_0 / &qusb_phy_0 okay"
+            echo "设备  : qualcommax / ipq60xx / zn_m2 (NAND + UBI)"
+            echo "文件  : $(basename "$SYS")"
+            echo "大小  : ${SIZE} bytes ($((SIZE/1048576)) MiB)"
+            echo "root  : ${ROOTLEN} bytes；magic ${MAGIC:-未解析}"
+            echo "SHA256: $(cut -d' ' -f1 sha256.txt)"
+            echo "时间  : $(date -u '+%Y-%m-%d %H:%M UTC')"
+          } | tee BUILD-REPORT.txt
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: znm2-612nss-run${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}/openwrt/bin/targets/qualcommax/ipq60xx/*zn_m2*
+            ${{ github.workspace }}/openwrt/bin/targets/qualcommax/ipq60xx/config.buildinfo
+            ${{ github.workspace }}/openwrt/bin/targets/qualcommax/ipq60xx/feeds.buildinfo
+            ${{ github.workspace }}/openwrt/bin/targets/qualcommax/ipq60xx/version.buildinfo
+            ${{ github.workspace }}/openwrt/bin/targets/qualcommax/ipq60xx/profiles.json
+            ${{ github.workspace }}/openwrt/bin/targets/qualcommax/ipq60xx/sha256sums
+            ${{ github.workspace }}/BUILD-REPORT.txt
+            ${{ github.workspace }}/sha256.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: znm2-612nss-latest
+          name: ZN-M2 6.12.116 NSS run${{ github.run_number }}
+          overwrite: true
+          body_path: ${{ github.workspace }}/BUILD-REPORT.txt
+          files: |
+            ${{ github.workspace }}/openwrt/bin/targets/qualcommax/ipq60xx/*zn_m2*
+            ${{ github.workspace }}/BUILD-REPORT.txt
+            ${{ github.workspace }}/sha256.txt
