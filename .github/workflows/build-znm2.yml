@@ -3,7 +3,7 @@ name: Build ZN-M2 (LibWrt 25.12-nss / Linux 6.12.116 / NSS)
 # 目标：兆能 ZN-M2 (zn,m2 / qualcommax-ipq60xx / 128MiB NAND + UBI)
 # 源码：LiBwrt/LibWrt 25.12-nss 分支 = Linux 6.12.116 + 满血 NSS 数据面
 # NSS 固件：11.4.0.5 Release 6（feed 默认值，与当前在用固件一致，支持 mesh）
-# 包管理器：APK（上游 CONFIG_USE_APK default y，配置内嵌本文件并由防线一校验）
+# 包管理器：opkg（上游 CONFIG_USE_APK default y，本包显式关闭；防线一校验）
 # 产物：*-zn_m2-squashfs-sysupgrade.bin（唯一可刷）+ factory.ubi（救砖备用）
 # 与旧 6.18 包的区别：保留 qca-nss-drv / ecm / pppoe 全套卸载。
 # 2026-11-14 第二版（用户定制）：
@@ -12,7 +12,13 @@ name: Build ZN-M2 (LibWrt 25.12-nss / Linux 6.12.116 / NSS)
 #   - OpenClash 只装「壳」（LuCI + 脚本），内核与数据库刷后从 U 盘备份恢复
 #   - CPU 编译期解锁 1.6/1.8GHz（放宽 OPP speedbin 位图）+ 可选开机定频
 #   - 首次开机把 LAN 预置为 192.168.9.1（避开光猫）
-#   - 保留 WiFi(ath11k+板级校准) / USB3.0 / 满血 NSS 11.4 / APK
+#   - 保留 WiFi(ath11k+板级校准) / USB3.0 / 满血 NSS 11.4 / opkg
+# 2026-11-14 定稿（用户最终口径）：
+#   - 不内置路由狗 NAS 界面（用户明确取消）；只保留 iStore 商店 + Argon 主题
+#   - 包管理器确定为 opkg / .ipk：seed 写 "# CONFIG_USE_APK is not set"，
+#     防线一禁止 CONFIG_USE_APK=y，BUILD-REPORT 标注 .ipk / Packages.gz
+#   - 修复 run #2 失败点：wpad-openssl 被 defconfig 丢弃（条件依赖未选中），
+#     补 libopenssl/libopenssl-legacy + wpad 变体兜底 + 批量校验
 # 网页版极简部署：本文件仍是唯一需要上传的文件。
 # 只手动触发，不做定时编译。
 
@@ -144,7 +150,7 @@ jobs:
           #     DEFAULT_PACKAGES += ath11k-firmware-ipq6018 nss-firmware-ipq60xx kmod-qca-nss-crypto
           #   - feeds.conf.default 自带 nss_packages (laipeng668/nss-packages;NSS-LibWrt)
           #     与 sqm_scripts_nss，workflow 的 feeds install -a 会自动拉取
-          #   - config/Config-build.in : CONFIG_USE_APK default y（包管理器是 APK）
+          #   - config/Config-build.in : CONFIG_USE_APK default y（上游默认 APK；本包显式关闭 → opkg）
           #   - image/ipq60xx.mk : define Device/zn_m2 用 FitImage + UbiFit，
           #     BLOCKSIZE 128k / PAGESIZE 2048，与本机 NAND 完全一致
           
@@ -165,18 +171,17 @@ jobs:
           CONFIG_CCACHE=y
           CONFIG_DEVEL=y
           CONFIG_BUILD_LOG=y
-          # 包管理器：上游 config/Config-build.in 第 71~74 行是
-          #   config USE_APK / imply PACKAGE_apk-openssl /
-          #   bool "Use APK instead of OPKG to build distribution" / default y
-          # 这里显式写死，避免上游默认值变动时静默编出 opkg 版固件；
-          # workflow 防线一会在 make defconfig 后校验这一项必须为 =y。
-          # 若确需编回 opkg：改成 "# CONFIG_USE_APK is not set"，源码层可行
-          # （package/system/opkg 仍在、target 层无强制），但 25.12 时代官方在线源
-          # 已是 .apk + packages.adb、没有 Packages.gz，后续装包生态不匹配，
-          # 且 README 的刷机清单与重建流程全部按 APK 编写 —— 不建议切。
-          CONFIG_USE_APK=y
+          # 包管理器：用户 2026-11-14 明确要求 opkg，不要 apk。
+          # 上游 config/Config-build.in 第 71~74 行 USE_APK 是 default y，
+          # 这里用 kconfig 标准的 "# CONFIG_USE_APK is not set" 显式关掉；
+          # package/system/opkg/Makefile 的 DEFAULT:=y if !USE_APK 会把 opkg 带入，
+          # 产物是 .ipk / Packages.gz；防线一会检查绝不能出现 CONFIG_USE_APK=y。
+          # 代价（如实记录）：25.12 时代官方在线源已 apk 化（.apk + packages.adb，
+          # 没有 Packages.gz），刷后 opkg update 需要另配提供 .ipk 索引的源；
+          # 但本版把定制软件全部烤进固件，日常不依赖在线源。
+          # CONFIG_USE_APK is not set
           
-          # ---- LuCI（本分支 USE_APK 默认 y，包管理器是 APK）------------------------
+          # ---- LuCI（本包关闭 USE_APK，包管理器是 opkg）---------------------------
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-ssl=y
           CONFIG_LUCI_LANG_zh_Hans=y
@@ -232,7 +237,7 @@ jobs:
           # 刷机后从 U 盘备份恢复，既不让固件变大，也不依赖 GitHub 慢速下载。
           # 关键改动：immortalwrt/luci @ openwrt-25.12 自带 luci-app-openclash，
           # 因此不再追加 vernesong/OpenClash dev 第三方 feed —— 两个 feed 提供
-          # 同名包会让 feeds install 冲突，且第三方 feed 在 APK/25.12 下易编译失败。
+          # 同名包会让 feeds install 冲突，且第三方 feed 在 25.12 下易编译失败。
           # 顺带把 TProxy 需要的两个内核模块烤进去（旧固件就是卡在这两个装不上）。
           CONFIG_PACKAGE_luci-app-openclash=y
           CONFIG_PACKAGE_kmod-nft-tproxy=y
@@ -286,6 +291,12 @@ jobs:
           CONFIG_PACKAGE_ath11k-firmware-ipq6018=y
           CONFIG_PACKAGE_ipq-wifi-zn_m2=y
           CONFIG_PACKAGE_wpad-openssl=y
+          # 上游 wpad-openssl 的 DEPENDS 是条件依赖 libopenssl /
+          # libopenssl-legacy；若这两个包没被选中，make defconfig 会把
+          # wpad-openssl 一并清成 n —— run #2 就挂在「WiFi/USB3 关键包
+          # wpad-openssl 未被选中」。这里显式补上依赖。
+          CONFIG_PACKAGE_libopenssl=y
+          CONFIG_PACKAGE_libopenssl-legacy=y
           
           # ---- USB 3.0 + 存储（U 盘 / 后续安全 extroot 要用）------------------------
           # DTS：ipq6000-cmiot.dtsi 引用 ipq6018-common.dtsi，后者已把
@@ -315,7 +326,7 @@ jobs:
           # 刷机后会清空的既有成果（需事后重建）：PPPoE 账号/密码（本机另存，勿上传）、
           # LAN 网段、IPv6 PD、WAN 加固（dropbear/uhttpd 只绑 LAN）、
           # OpenClash + 免费 TOP30 节点、ACME 证书、ddns-go、自研 LuCI 模块、
-          # U 盘挂载配置。包管理器也会从 opkg 换成 apk。
+          # U 盘挂载配置。包管理器保持 opkg（与当前 KWRT 一致），但软件源需重配。
           ZNM2_SEED_EOF
           # NSS 固件版本由 dispatch 输入决定，先清掉 seed 里的默认项再写
           sed -i '/^CONFIG_NSS_FIRMWARE_VERSION_/d' "${OW}/.config"
@@ -323,6 +334,7 @@ jobs:
           echo "NSS 固件选择: CONFIG_NSS_FIRMWARE_VERSION_${NSS_FW}=y"
           # iStore 不在 LibWrt 自带 feed；按官方 README 追加 istore feed。
           # linkease/istore 会重定向到 istoreos/istore，git 能跟随重定向。
+          # 用户定稿：不追加 linkease nas / nas_luci 两个 feed（不要路由狗界面）。
           if [ "${{ inputs.with_istore }}" = "true" ]; then
             echo '' >> "${OW}/feeds.conf.default"
             echo 'src-git istore https://github.com/linkease/istore;main' >> "${OW}/feeds.conf.default"
@@ -339,6 +351,15 @@ jobs:
             ./scripts/feeds install -d y -p istore luci-app-store
           fi
           make defconfig
+          # 上游 DEFAULT_PACKAGES 含 wpad-openssl，但条件依赖未满足时
+          # kconfig 会把整项清掉（run #2 实测）。兜底：至少留一个 wpad 变体。
+          if ! grep -qE '^CONFIG_PACKAGE_wpad(-[a-z0-9-]+)?=y' .config; then
+            echo "::warning:: 没有 wpad 变体被选中，回退到 wpad-basic-mbedtls"
+            echo 'CONFIG_PACKAGE_wpad-basic-mbedtls=y' >> .config
+            make defconfig
+          fi
+          echo "=== 实际选中的 wpad 变体 ==="
+          grep -E '^CONFIG_PACKAGE_wpad[^=]*=y' .config || true
 
       # 防线一：确认设备 / 文件系统 / NSS 关键包，不对就停工。
       # LibWrt 的 target-metadata.pl 生成 CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2，
@@ -357,10 +378,12 @@ jobs:
           fi
           grep -q '^CONFIG_TARGET_ROOTFS_SQUASHFS=y' .config || {
             echo "::error:: 未启用 squashfs，本机 NAND/UBI 刷不了"; exit 1; }
-          echo "--- 包管理器 ---"
-          grep -E '^CONFIG_USE_APK' .config || true
-          grep -q '^CONFIG_USE_APK=y' .config || {
-            echo "::error:: CONFIG_USE_APK 未启用；刷机清单与重建流程全部按 APK 编写，拒绝继续"; exit 1; }
+          echo "--- 包管理器（用户要求 opkg，禁止 APK）---"
+          grep -E '^# CONFIG_USE_APK is not set|^CONFIG_USE_APK' .config || true
+          if grep -q '^CONFIG_USE_APK=y' .config; then
+            echo "::error:: CONFIG_USE_APK=y，会编成 APK 固件；用户明确要求 opkg，拒绝继续"; exit 1
+          fi
+          grep -q '^CONFIG_PACKAGE_opkg=y' .config || echo "::warning:: 未显式看到 CONFIG_PACKAGE_opkg=y（应由 !USE_APK 默认带入）"
           echo "--- NSS 关键包（必须 =y）---"
           grep -E '^CONFIG_PACKAGE_(kmod-qca-nss-drv|kmod-qca-nss-ecm|kmod-qca-nss-drv-pppoe|nss-firmware-ipq60xx)=' .config || true
           for p in kmod-qca-nss-drv kmod-qca-nss-ecm kmod-qca-nss-drv-pppoe nss-firmware-ipq60xx; do
@@ -370,17 +393,38 @@ jobs:
           grep -q "^CONFIG_NSS_FIRMWARE_VERSION_${NSS_FW}=y" .config || {
             echo "::error:: NSS 固件版本未选中或与 dispatch 输入 ${NSS_FW} 不一致（默认应为 11_4）"; exit 1; }
           echo "--- WiFi / USB3 关键包（必须 =y）---"
-          grep -E '^CONFIG_PACKAGE_(kmod-ath11k|kmod-ath11k-ahb|ath11k-firmware-ipq6018|ipq-wifi-zn_m2|wpad-openssl|kmod-usb3|kmod-usb-dwc3|kmod-usb-dwc3-qcom|kmod-usb-storage|kmod-usb-storage-uas)=' .config || true
-          for p in kmod-ath11k kmod-ath11k-ahb ath11k-firmware-ipq6018 ipq-wifi-zn_m2 wpad-openssl \
+          grep -E '^CONFIG_PACKAGE_(kmod-ath11k|kmod-ath11k-ahb|ath11k-firmware-ipq6018|ipq-wifi-zn_m2|kmod-usb3|kmod-usb-dwc3|kmod-usb-dwc3-qcom|kmod-usb-storage|kmod-usb-storage-uas)=' .config || true
+          MISSING=""
+          for p in kmod-ath11k kmod-ath11k-ahb ath11k-firmware-ipq6018 ipq-wifi-zn_m2 \
                    kmod-usb3 kmod-usb-dwc3 kmod-usb-dwc3-qcom kmod-usb-storage kmod-usb-storage-uas; do
-            grep -q "^CONFIG_PACKAGE_${p}=y" .config || {
-              echo "::error:: WiFi/USB3 关键包 ${p} 未被选中，拒绝继续（要求带 WiFi + USB3 支持）"; exit 1; }
+            if ! grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "  缺失: $p"
+              MISSING="$MISSING $p"
+            fi
           done
+          echo "--- wpad（WiFi 认证守护进程，任一变体 =y 即可）---"
+          grep -E '^CONFIG_PACKAGE_wpad[^=]*=' .config || true
+          grep -qE '^CONFIG_PACKAGE_wpad(-[a-z0-9-]+)?=y' .config || {
+            echo "::error:: 没有任何 wpad 变体被选中，WiFi 起不来，拒绝继续"; exit 1; }
+          if [ -n "$MISSING" ]; then
+            echo "::error:: 以下 WiFi/USB3 关键包未被选中:$MISSING（要求带 WiFi + USB3 支持），拒绝继续"
+            exit 1
+          fi
           echo "--- 实际选中的 NSS 固件版本 ---"
           grep -E '^CONFIG_NSS_FIRMWARE_VERSION_' .config || true
           if grep -q '^CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_8devices_mango-dvk=y' .config; then
             echo "::warning:: mango-dvk 也被选中；发布环节只取 zn_m2 文件"
           fi
+
+      # 无论防线一成功与否，都把展开后的 .config 留档，便于下次一次看全缺失项。
+      - name: Upload defconfig for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: znm2-defconfig-run${{ github.run_number }}
+          path: ${{ github.workspace }}/openwrt/.config
+          if-no-files-found: warn
+          retention-days: 7
 
       # CPU 1.8GHz 解锁（编译期，唯一可行路径）：
       # 主线 ipq6018.dtsi 把 1608/1800 两档写成 opp-supported-hw = <0x1>，
@@ -524,10 +568,11 @@ jobs:
             echo "内核  : ${KLINE:-Linux 6.12.x}"
             echo "NSS   : 固件 ${NSS_FW}（11_4 时驱动源码为 QSDK 11.4.0.5 / patches-11.4，与当前在用一致）"
             echo "NSS包 : kmod-qca-nss-drv / ecm / drv-pppoe / dp / ssdk 全套"
-            echo "包管理: APK（CONFIG_USE_APK=y，apk 3.0.5；命令 apk update/add/del）"
+            echo "包管理: opkg / .ipk（# CONFIG_USE_APK is not set；产物 .ipk + Packages.gz；命令 opkg update/install/remove）"
             echo "WiFi  : ath11k(AHB) + ath11k-firmware-ipq6018 + ipq-wifi-zn_m2 板级校准 + wpad-openssl；DTS &wifi okay"
             echo "USB3  : kmod-usb3/dwc3/dwc3-qcom + storage/uas；DTS &usb3 / &ssphy_0 / &qusb_phy_0 okay"
             echo "内置包: iStore / OpenClash(仅壳) / ddns-go / acme / cpufreq / samba4 / upnp / tailscale / ttyd / irqbalance / Argon Light"
+            echo "不含  : 路由狗 NAS 界面（用户定稿取消；底层 samba4 + USB 存储 + 文件系统仍在）"
             echo "OC壳  : 只含 LuCI+脚本；mihomo 内核 / GeoIP / 节点池刷后从备份恢复，未烤入固件"
             if [ "${{ inputs.cpu_unlock_18 }}" = "true" ]; then
               echo "CPU   : 1.6/1.8GHz OPP 位图 <0x1>→<0xf>（speedbin 解锁，最高 1.8GHz）"
