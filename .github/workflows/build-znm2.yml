@@ -13,6 +13,17 @@ name: Build ZN-M2 (LibWrt 25.12-nss / Linux 6.12.116 / NSS)
 #   - CPU 编译期解锁 1.6/1.8GHz（放宽 OPP speedbin 位图）+ 可选开机定频
 #   - 首次开机把 LAN 预置为 192.168.9.1（避开光猫）
 #   - 保留 WiFi(ath11k+板级校准) / USB3.0 / 满血 NSS 11.4 / opkg
+# 2026-11-15 v11：run #10 证明 EXTRA_COMPAT 修复生效（grep.c 已编过）后，
+#     暴露同一族下一颗雷：networking/inetd.c 报 rpc/rpc.h: No such file or
+#     directory。inetd.c 只在 CONFIG_FEATURE_INETD_RPC=y 时 include <rpc/*.h>，
+#     musl 不提供 SunRPC 头（上游只为 glibc 加 libtirpc 依赖，musl 直接炸）。
+#     全源码用 rpc 头的只有两个文件：inetd.c 与 util-linux/mount.c（后者仅在
+#     CONFIG_FEATURE_MOUNT_NFS=y 时）。busybox 官方默认 INETD=y / 两项 RPC 均 n，
+#     LibWrt Config-defaults.in 亦为 n；无论 y 从哪层进来，v11 把
+#     INETD / FEATURE_INETD_RPC / FEATURE_MOUNT_NFS 与原四项一起做「七项四层」
+#     统一按死（主 .config + busybox .config 双段 sed + autoconf.h 兜底 + 断言）。
+#     这三个 applet 家用路由用不到：inetd 是遗留超级服务器，NFS 挂载用不上。
+#     另核实 init.c 的 execinfo.h（musl 也没有）在 DEBUG_SEGV_HANDLER=0 下永不编入。
 # 2026-11-15 v10：run #8 关掉 WERROR/SELINUX/PAM 后暴露下一层根因 ——
 #     busybox CONFIG_EXTRA_COMPAT=y 时 findutils/grep.c 走 glibc 私有 GNU regex API
 #     （RE_TRANSLATE_TYPE / re_compile_pattern / re_syntax_options ...），musl 不提供，
@@ -396,7 +407,7 @@ jobs:
           echo "=== 实际选中的 wpad 变体 ==="
           grep -E '^CONFIG_PACKAGE_wpad[^=]*=y' .config || true
           # ------------------------------------------------------------------
-          # busybox 1.37.0 在 musl 上的两处独立坑（run #4/#5 与 run #8）
+          # busybox 1.37.0 在 musl 上的三处独立坑（run #4/#5、run #8、run #10）
           #   A) security_context_t deprecated + -Werror（WERROR / SELINUX / PAM）
           #   B) run #8：把 A 按下去后，findutils/grep.c 报 RE_TRANSLATE_TYPE
           #      unknown、struct re_registers incomplete、re_compile_pattern /
@@ -404,29 +415,38 @@ jobs:
           #      这是 CONFIG_EXTRA_COMPAT=y 时的 #else 分支，用的是 glibc 私有
           #      GNU regex API；musl 只有 POSIX regex_t，必然编不过。
           #      （busybox 官方与 LibWrt Config-defaults.in 该项都 default n）
+          #   C) run #10：EXTRA_COMPAT 修复生效后，networking/inetd.c 报
+          #      rpc/rpc.h: No such file or directory（第 255 行，
+          #      #if ENABLE_FEATURE_INETD_RPC 分支）。musl 无 SunRPC 头；
+          #      上游只为 glibc 场景加 libtirpc 依赖（busybox Makefile 的
+          #      DEPENDS 行），musl + INETD_RPC=y 必然炸。全源码用 rpc 头的
+          #      只有 inetd.c 与 util-linux/mount.c（仅 FEATURE_MOUNT_NFS=y 时）。
+          #      路由器用不到 inetd 与 NFS 老内核挂载，直接关闭三件套：
+          #      INETD / FEATURE_INETD_RPC / FEATURE_MOUNT_NFS。
           # run #5 证明「只在 oldconfig 之前追加 # CONFIG_X is not set」无效：
           #   重复符号定义会被 oldconfig 丢掉，日志里 LDLIBS="pam pam_misc pthread"
           #   与 -Werror 依旧。所以必须直接 sed 掉 =y 那一行，而不是追加。
-          # 四项统一处理（WERROR / SELINUX / PAM / EXTRA_COMPAT），四层兜底：
+          # 七项统一处理（WERROR / SELINUX / PAM / EXTRA_COMPAT /
+          #              INETD / FEATURE_INETD_RPC / FEATURE_MOUNT_NFS），四层兜底：
           #   1) 主 .config 源头关掉并显式补齐关闭行（LDLIBS 等读的是主 .config）
           #   2) busybox 的 Build/Configure 在 oldconfig 前后各 sed 一次（v9 无裸 $ 写法）
           #   3) 第二次 sed 后重跑一次 oldconfig，让 kconfig 按修好的 .config
-          #      重新生成全套 autoconf.h / IF_ 宏；再把 ENABLE_EXTRA_COMPAT 兜底按成 0
+          #      重新生成全套 autoconf.h / IF_ 宏；再把对应 ENABLE_* 兜底按成 0
           #   4) MAKE_FLAGS 的 EXTRA_CFLAGS 追加 -Wno-error=deprecated-declarations
           # 另：Build 开头做零成本静态自检（不触发编译），确认修复都在再开编。
-          sed -i -E 's/^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT)=y$/# CONFIG_BUSYBOX_\1_\2 is not set/' .config
+          sed -i -E 's/^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT|INETD|FEATURE_INETD_RPC|FEATURE_MOUNT_NFS)=y$/# CONFIG_BUSYBOX_\1_\2 is not set/' .config
           # 显式补齐关闭行：防止 make defconfig 省略 default-n 的 bool 项，
-          # 让 busybox 的 oldconfig 拿源码默认值（本分支疑似 y）重新打开。
+          # 让 busybox 的 oldconfig 拿源码默认值（busybox 官方 INETD 就 default y）重新打开。
           for sym in DEFAULT CONFIG; do
-            for item in WERROR SELINUX PAM EXTRA_COMPAT; do
+            for item in WERROR SELINUX PAM EXTRA_COMPAT INETD FEATURE_INETD_RPC FEATURE_MOUNT_NFS; do
               key="CONFIG_BUSYBOX_${sym}_${item}"
               grep -q "^# ${key} is not set" .config || echo "# ${key} is not set" >> .config
             done
           done
           echo "=== 主 .config 里的 busybox 关键项（应全部 is not set）==="
-          grep -E '^# CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT) is not set|^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT)=' .config || true
-          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT)=y' .config; then
-            echo "::error:: busybox WERROR/SELINUX/PAM/EXTRA_COMPAT 仍为 y，拒绝继续"; exit 1
+          grep -E '^# CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT|INETD|FEATURE_INETD_RPC|FEATURE_MOUNT_NFS) is not set|^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT|INETD|FEATURE_INETD_RPC|FEATURE_MOUNT_NFS)=' .config || true
+          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT|INETD|FEATURE_INETD_RPC|FEATURE_MOUNT_NFS)=y' .config; then
+            echo "::error:: busybox 七项仍有 y（含 INETD/INETD_RPC/MOUNT_NFS），拒绝继续"; exit 1
           fi
           python3 - "${OW}/package/utils/busybox/Makefile" <<'PY'
           import sys
@@ -446,21 +466,23 @@ jobs:
           #    最终 shell 收到 's/^CONFIG_WERROR=y# CONFIG_WERROR is not set/'
           #    （sed: unterminated `s' command）。所以彻底不用 $ 行尾锚点，
           #    改用 '.*' 吞掉行尾；整条命令不含任何裸 $，双重展开也伤不到。
-          sedfix = ("\tsed -i -e 's/^CONFIG_WERROR=y.*/# CONFIG_WERROR is not set/' "
-                    "-e 's/^CONFIG_SELINUX=y.*/# CONFIG_SELINUX is not set/' "
-                    "-e 's/^CONFIG_PAM=y.*/# CONFIG_PAM is not set/' "
-                    "-e 's/^CONFIG_EXTRA_COMPAT=y.*/# CONFIG_EXTRA_COMPAT is not set/' "
-                    "$(PKG_BUILD_DIR)/.config")
+          bb_items = ['WERROR', 'SELINUX', 'PAM', 'EXTRA_COMPAT',
+                      'INETD', 'FEATURE_INETD_RPC', 'FEATURE_MOUNT_NFS']
+          sedfix = ("\tsed -i "
+                    + " ".join("-e 's/^CONFIG_" + i + "=y.*/# CONFIG_" + i + " is not set/'" for i in bb_items)
+                    + " $(PKG_BUILD_DIR)/.config")
           # oldconfig 之后重跑一次 kconfig：让 autoconf.h 的 ENABLE_ / IF_ 宏
           # 全套按修好的 .config 重新生成，而不是只改 ENABLE_ 一个宏。
-          postfix = ("\tsed -i -e 's/^#define ENABLE_EXTRA_COMPAT 1.*/#define ENABLE_EXTRA_COMPAT 0/' "
-                     "$(PKG_BUILD_DIR)/include/autoconf.h")
-          diag = ("\tgrep -nE '^(CONFIG_EXTRA_COMPAT|# CONFIG_EXTRA_COMPAT|#define ENABLE_EXTRA_COMPAT)' "
+          postfix = ("\tsed -i "
+                     + " ".join("-e 's/^#define ENABLE_" + i + " 1.*/#define ENABLE_" + i + " 0/'" for i in bb_items)
+                     + " $(PKG_BUILD_DIR)/include/autoconf.h")
+          alt = "|".join(bb_items)
+          diag = ("\tgrep -nE '^(# )?CONFIG_(" + alt + ")[= ]|^#define ENABLE_(" + alt + ") ' "
                   "$(PKG_BUILD_DIR)/.config $(PKG_BUILD_DIR)/include/autoconf.h || true")
-          check1 = ("\t! grep -q '^CONFIG_EXTRA_COMPAT=y' $(PKG_BUILD_DIR)/.config || "
-                    "{ echo '::error:: busybox .config 里 EXTRA_COMPAT 仍为 y'; exit 1; }")
-          check2 = ("\tgrep -q '^#define ENABLE_EXTRA_COMPAT 0' $(PKG_BUILD_DIR)/include/autoconf.h || "
-                    "{ echo '::error:: autoconf.h 里 ENABLE_EXTRA_COMPAT 不是 0'; exit 1; }")
+          check1 = ("\t! grep -qE '^CONFIG_(" + alt + ")=y' $(PKG_BUILD_DIR)/.config || "
+                    "{ echo '::error:: busybox .config 里七项仍有 y'; exit 1; }")
+          check2 = ("\t! grep -qE '^#define ENABLE_(" + alt + ") 1' $(PKG_BUILD_DIR)/include/autoconf.h || "
+                    "{ echo '::error:: autoconf.h 里 ENABLE_* 宏仍有 1'; exit 1; }")
           oldcfg = "\tyes 'n' | $(MAKE) -C $(PKG_BUILD_DIR) $(MAKE_FLAGS) oldconfig"
           assert oldcfg in s, '::error:: busybox oldconfig 结构变化，拒绝盲目编译'
           if sedfix not in s:
@@ -478,10 +500,10 @@ jobs:
           assert '=y$$/' not in s, '::error:: busybox Makefile 残留 v8 的 $$ 锚点'
           assert '-Wno-error=deprecated-declarations' in s, '::error:: 编译标志兜底未写入'
           open(p, 'w', encoding='utf-8', newline='\n').write(s)
-          print('busybox: 四项四层修复已写入（主配置 + 双段 sed + kconfig 重生成 + -Wno-error）')
+          print('busybox: 七项四层修复已写入（主配置 + 双段 sed + kconfig 重生成 + -Wno-error）')
           PY
           echo "=== 注入后 Makefile 的关键行 ==="
-          grep -nE 'EXTRA_CFLAGS=|Wno-error|CONFIG_WERROR|CONFIG_SELINUX|CONFIG_PAM|EXTRA_COMPAT|autoconf|oldconfig' "${OW}/package/utils/busybox/Makefile" | head -30
+          grep -nE 'EXTRA_CFLAGS=|Wno-error|CONFIG_WERROR|CONFIG_SELINUX|CONFIG_PAM|CONFIG_EXTRA_COMPAT|CONFIG_INETD|CONFIG_FEATURE_INETD_RPC|CONFIG_FEATURE_MOUNT_NFS|autoconf|oldconfig' "${OW}/package/utils/busybox/Makefile" | head -40
 
       # 防线一：确认设备 / 文件系统 / NSS 关键包，不对就停工。
       # LibWrt 的 target-metadata.pl 生成 CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2，
@@ -631,25 +653,33 @@ jobs:
           # 单包目标不走 toolchain/install，staging_dir/toolchain-*/lib/ 下还没有
           # libgcc_s.so.*，会先挂在 package/libs/toolchain（cp: cannot stat ...）。
           # 完整 `make world` 才会按依赖链把工具链装好；run #4/#5 已证明能走到 busybox。
-          # 这里只做零成本静态自检，确认四层修复都在，避免再空跑 2 小时。
-          echo "=== busybox 四项四层修复静态自检（不触发编译）==="
+          # 这里只做零成本静态自检，确认七项四层修复都在，避免再空跑 2 小时。
+          echo "=== busybox 七项四层修复静态自检（不触发编译）==="
           BAD=0
-          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT)=y' .config; then
-            echo "::error:: 主 .config 仍有 busybox WERROR/SELINUX/PAM/EXTRA_COMPAT = y"; BAD=1
+          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT|INETD|FEATURE_INETD_RPC|FEATURE_MOUNT_NFS)=y' .config; then
+            echo "::error:: 主 .config 仍有 busybox 七项 = y（含 INETD/INETD_RPC/MOUNT_NFS）"; BAD=1
           fi
           BBMK=package/utils/busybox/Makefile
           grep -Fq 's/^CONFIG_WERROR=y.*/' "$BBMK" || { echo "::error:: busybox Makefile 缺少 v9 无锚点 sed"; BAD=1; }
           [ "$(grep -Fc 's/^CONFIG_WERROR=y.*/' "$BBMK")" -eq 2 ] || { echo "::error:: busybox 双段 sed 数量不对"; BAD=1; }
           grep -Fq 's/^CONFIG_EXTRA_COMPAT=y.*/' "$BBMK" || { echo "::error:: busybox Makefile 缺少 EXTRA_COMPAT sed"; BAD=1; }
           [ "$(grep -Fc 's/^CONFIG_EXTRA_COMPAT=y.*/' "$BBMK")" -eq 2 ] || { echo "::error:: busybox EXTRA_COMPAT sed 数量不对"; BAD=1; }
+          grep -Fq 's/^CONFIG_INETD=y.*/' "$BBMK" || { echo "::error:: busybox Makefile 缺少 INETD sed"; BAD=1; }
+          [ "$(grep -Fc 's/^CONFIG_INETD=y.*/' "$BBMK")" -eq 2 ] || { echo "::error:: busybox INETD sed 数量不对"; BAD=1; }
+          grep -Fq 's/^CONFIG_FEATURE_INETD_RPC=y.*/' "$BBMK" || { echo "::error:: busybox Makefile 缺少 INETD_RPC sed"; BAD=1; }
+          grep -Fq 's/^CONFIG_FEATURE_MOUNT_NFS=y.*/' "$BBMK" || { echo "::error:: busybox Makefile 缺少 MOUNT_NFS sed"; BAD=1; }
           grep -Fq '#define ENABLE_EXTRA_COMPAT 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 autoconf.h 兜底"; BAD=1; }
-          grep -Fq 'ENABLE_EXTRA_COMPAT 不是 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 EXTRA_COMPAT 断言"; BAD=1; }
+          grep -Fq '#define ENABLE_INETD 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 ENABLE_INETD 兜底"; BAD=1; }
+          grep -Fq '#define ENABLE_FEATURE_INETD_RPC 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 ENABLE_INETD_RPC 兜底"; BAD=1; }
+          grep -Fq '#define ENABLE_FEATURE_MOUNT_NFS 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 ENABLE_MOUNT_NFS 兜底"; BAD=1; }
+          grep -Fq 'ENABLE_EXTRA_COMPAT 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 EXTRA_COMPAT 断言"; BAD=1; }
+          grep -Fq 'ENABLE_\* 宏仍有 1' "$BBMK" || { echo "::error:: busybox Makefile 缺少 ENABLE_* 断言"; BAD=1; }
           if grep -Fq '=y$$/' "$BBMK"; then echo '::error:: 残留 v8 的 $$ 锚点，make 双重展开会吃掉'; BAD=1; fi
           grep -Fq -- '-Wno-error=deprecated-declarations' "$BBMK" || { echo "::error:: busybox Makefile 缺少 -Wno-error 兜底"; BAD=1; }
           if [ "$BAD" -ne 0 ]; then
             echo "::error:: busybox 修复自检未通过，终止（避免空跑 2 小时）"; exit 1
           fi
-          echo "  ① 主 .config 四项已关  ② 双段 sed(含 EXTRA_COMPAT)  ③ kconfig 重生成 + autoconf.h 按 0  ④ -Wno-error"
+          echo "  ① 主 .config 七项已关  ② 双段 sed(含 INETD/INETD_RPC/MOUNT_NFS)  ③ kconfig 重生成 + ENABLE_* 按 0  ④ -Wno-error"
           # 保留原来的「并行失败后 -j1 V=s 重跑」逻辑，同时把两份输出留档：
           # 失败时只上传末尾若干行，避免以后还要手动复制几万行日志。
           if ! make -j"$(nproc)" 2>&1 | tee build-parallel.log; then
@@ -750,6 +780,7 @@ jobs:
             echo "内置包: iStore / OpenClash(仅壳) / ddns-go / acme / cpufreq / samba4 / upnp / tailscale / ttyd / irqbalance / Argon Light"
             echo "不含  : 路由狗 NAS 界面（用户定稿取消；底层 samba4 + USB 存储 + 文件系统仍在）"
             echo "OC壳  : 只含 LuCI+脚本；mihomo 内核 / GeoIP / 节点池刷后从备份恢复，未烤入固件"
+            echo "busybox: 关闭 inetd/INETD_RPC/MOUNT_NFS（musl 无 SunRPC 头）+ WERROR/SELINUX/PAM/EXTRA_COMPAT"
             if [ "${{ inputs.cpu_unlock_18 }}" = "true" ]; then
               echo "CPU   : 1.6/1.8GHz OPP 位图 <0x1>→<0xf>（speedbin 解锁，最高 1.8GHz）"
             else
