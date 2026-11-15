@@ -13,6 +13,14 @@ name: Build ZN-M2 (LibWrt 25.12-nss / Linux 6.12.116 / NSS)
 #   - CPU 编译期解锁 1.6/1.8GHz（放宽 OPP speedbin 位图）+ 可选开机定频
 #   - 首次开机把 LAN 预置为 192.168.9.1（避开光猫）
 #   - 保留 WiFi(ath11k+板级校准) / USB3.0 / 满血 NSS 11.4 / opkg
+# 2026-11-15 v10：run #8 关掉 WERROR/SELINUX/PAM 后暴露下一层根因 ——
+#     busybox CONFIG_EXTRA_COMPAT=y 时 findutils/grep.c 走 glibc 私有 GNU regex API
+#     （RE_TRANSLATE_TYPE / re_compile_pattern / re_syntax_options ...），musl 不提供，
+#     必然编译失败。v10 把 EXTRA_COMPAT 加入主 .config 防线 + 双段 sed，
+#     oldconfig 之后重跑一次 kconfig 让头文件全套一致，并把 autoconf.h 的
+#     ENABLE_EXTRA_COMPAT 兜底按成 0；同时留日志证据与编译前硬断言。
+#     另修 actionlint 抓到的隐患：release 步骤 overwrite 输入在 v2 已不存在，
+#     改为 overwrite_files（此前从未跑到过该步骤，编译一成功就会踩到）。
 # 2026-11-15 v9：busybox 第②层 sed 改成完全不含 $ 的写法（run #7 证明
 #     define + $(eval) 双重展开会把 '=y$$/' 吃成 '=y'，sed 报 unterminated s）。
 #     主 .config 防线 + -Wno-error 兜底 + Build 静态自检 + 完整 make world 均保留。
@@ -388,23 +396,37 @@ jobs:
           echo "=== 实际选中的 wpad 变体 ==="
           grep -E '^CONFIG_PACKAGE_wpad[^=]*=y' .config || true
           # ------------------------------------------------------------------
-          # busybox 1.37.0 / security_context_t deprecated + -Werror（run #4 / #5）
+          # busybox 1.37.0 在 musl 上的两处独立坑（run #4/#5 与 run #8）
+          #   A) security_context_t deprecated + -Werror（WERROR / SELINUX / PAM）
+          #   B) run #8：把 A 按下去后，findutils/grep.c 报 RE_TRANSLATE_TYPE
+          #      unknown、struct re_registers incomplete、re_compile_pattern /
+          #      re_search / re_syntax_options / RE_SYNTAX_EGREP 未定义。
+          #      这是 CONFIG_EXTRA_COMPAT=y 时的 #else 分支，用的是 glibc 私有
+          #      GNU regex API；musl 只有 POSIX regex_t，必然编不过。
+          #      （busybox 官方与 LibWrt Config-defaults.in 该项都 default n）
           # run #5 证明「只在 oldconfig 之前追加 # CONFIG_X is not set」无效：
-          #   Makefile 行号 178→181 说明三行注入确实执行了，但 oldconfig 会重写
-          #   $(PKG_BUILD_DIR)/.config，把后追加的关闭行冲掉；日志里
-          #   LDLIBS="pam pam_misc pthread" 与 -Werror 依旧，三项仍是 y。
-          # 三层修复，任何一层生效都不会再挂：
-          #   1) 主 .config 源头关掉 CONFIG_BUSYBOX_{DEFAULT|CONFIG}_{WERROR,SELINUX,PAM}
-          #      （LDLIBS / PKG_BUILD_DEPENDS 读的是主 .config，不是 busybox 内部 .config）
-          #   2) busybox 的 Build/Configure 在 oldconfig 之后再 sed 一次（决定性）
-          #   3) MAKE_FLAGS 的 EXTRA_CFLAGS 追加 -Wno-error=deprecated-declarations
-          #      —— 即使前两层全失效，deprecated 也只是警告，不会变致命错误
-          # 另：Build 开头做零成本静态自检（不触发编译），确认三层修复都在再开编。
-          sed -i -E 's/^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=y$/# CONFIG_BUSYBOX_\1_\2 is not set/' .config
+          #   重复符号定义会被 oldconfig 丢掉，日志里 LDLIBS="pam pam_misc pthread"
+          #   与 -Werror 依旧。所以必须直接 sed 掉 =y 那一行，而不是追加。
+          # 四项统一处理（WERROR / SELINUX / PAM / EXTRA_COMPAT），四层兜底：
+          #   1) 主 .config 源头关掉并显式补齐关闭行（LDLIBS 等读的是主 .config）
+          #   2) busybox 的 Build/Configure 在 oldconfig 前后各 sed 一次（v9 无裸 $ 写法）
+          #   3) 第二次 sed 后重跑一次 oldconfig，让 kconfig 按修好的 .config
+          #      重新生成全套 autoconf.h / IF_ 宏；再把 ENABLE_EXTRA_COMPAT 兜底按成 0
+          #   4) MAKE_FLAGS 的 EXTRA_CFLAGS 追加 -Wno-error=deprecated-declarations
+          # 另：Build 开头做零成本静态自检（不触发编译），确认修复都在再开编。
+          sed -i -E 's/^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT)=y$/# CONFIG_BUSYBOX_\1_\2 is not set/' .config
+          # 显式补齐关闭行：防止 make defconfig 省略 default-n 的 bool 项，
+          # 让 busybox 的 oldconfig 拿源码默认值（本分支疑似 y）重新打开。
+          for sym in DEFAULT CONFIG; do
+            for item in WERROR SELINUX PAM EXTRA_COMPAT; do
+              key="CONFIG_BUSYBOX_${sym}_${item}"
+              grep -q "^# ${key} is not set" .config || echo "# ${key} is not set" >> .config
+            done
+          done
           echo "=== 主 .config 里的 busybox 关键项（应全部 is not set）==="
-          grep -E '^# CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM) is not set|^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=' .config || true
-          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=y' .config; then
-            echo "::error:: busybox WERROR/SELINUX/PAM 仍为 y，拒绝继续"; exit 1
+          grep -E '^# CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT) is not set|^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT)=' .config || true
+          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT)=y' .config; then
+            echo "::error:: busybox WERROR/SELINUX/PAM/EXTRA_COMPAT 仍为 y，拒绝继续"; exit 1
           fi
           python3 - "${OW}/package/utils/busybox/Makefile" <<'PY'
           import sys
@@ -414,8 +436,9 @@ jobs:
           # 3) 编译标志兜底：deprecated 警告不升级为错误
           cflag_old = '\tEXTRA_CFLAGS="$(TARGET_CFLAGS) $(TARGET_CPPFLAGS)" \\\n'
           cflag_new = '\tEXTRA_CFLAGS="$(TARGET_CFLAGS) $(TARGET_CPPFLAGS) -Wno-error=deprecated-declarations" \\\n'
-          assert cflag_old in s, '::error:: busybox EXTRA_CFLAGS 结构变化，拒绝盲目编译'
-          s = s.replace(cflag_old, cflag_new, 1)
+          if cflag_old in s:
+              s = s.replace(cflag_old, cflag_new, 1)
+          assert cflag_old in s or cflag_new in s, '::error:: busybox EXTRA_CFLAGS 结构变化，拒绝盲目编译'
 
           # 2) oldconfig 前后各强制一次。
           #    run #7 实测：recipe 里写 '$$' 不够 —— define + $(eval) 会让 make
@@ -425,20 +448,40 @@ jobs:
           #    改用 '.*' 吞掉行尾；整条命令不含任何裸 $，双重展开也伤不到。
           sedfix = ("\tsed -i -e 's/^CONFIG_WERROR=y.*/# CONFIG_WERROR is not set/' "
                     "-e 's/^CONFIG_SELINUX=y.*/# CONFIG_SELINUX is not set/' "
-                    "-e 's/^CONFIG_PAM=y.*/# CONFIG_PAM is not set/' $(PKG_BUILD_DIR)/.config")
+                    "-e 's/^CONFIG_PAM=y.*/# CONFIG_PAM is not set/' "
+                    "-e 's/^CONFIG_EXTRA_COMPAT=y.*/# CONFIG_EXTRA_COMPAT is not set/' "
+                    "$(PKG_BUILD_DIR)/.config")
+          # oldconfig 之后重跑一次 kconfig：让 autoconf.h 的 ENABLE_ / IF_ 宏
+          # 全套按修好的 .config 重新生成，而不是只改 ENABLE_ 一个宏。
+          postfix = ("\tsed -i -e 's/^#define ENABLE_EXTRA_COMPAT 1.*/#define ENABLE_EXTRA_COMPAT 0/' "
+                     "$(PKG_BUILD_DIR)/include/autoconf.h")
+          diag = ("\tgrep -nE '^(CONFIG_EXTRA_COMPAT|# CONFIG_EXTRA_COMPAT|#define ENABLE_EXTRA_COMPAT)' "
+                  "$(PKG_BUILD_DIR)/.config $(PKG_BUILD_DIR)/include/autoconf.h || true")
+          check1 = ("\t! grep -q '^CONFIG_EXTRA_COMPAT=y' $(PKG_BUILD_DIR)/.config || "
+                    "{ echo '::error:: busybox .config 里 EXTRA_COMPAT 仍为 y'; exit 1; }")
+          check2 = ("\tgrep -q '^#define ENABLE_EXTRA_COMPAT 0' $(PKG_BUILD_DIR)/include/autoconf.h || "
+                    "{ echo '::error:: autoconf.h 里 ENABLE_EXTRA_COMPAT 不是 0'; exit 1; }")
           oldcfg = "\tyes 'n' | $(MAKE) -C $(PKG_BUILD_DIR) $(MAKE_FLAGS) oldconfig"
           assert oldcfg in s, '::error:: busybox oldconfig 结构变化，拒绝盲目编译'
           if sedfix not in s:
-              s = s.replace(oldcfg, sedfix + "\n" + oldcfg + "\n" + sedfix, 1)
+              block = (sedfix + "\n" + oldcfg + "\n" + sedfix + "\n" +
+                       oldcfg + "\n" + postfix + "\n" + diag + "\n" +
+                       check1 + "\n" + check2)
+              s = s.replace(oldcfg, block, 1)
           assert s.count(sedfix) == 2, '::error:: busybox 双段 sed 未写入'
-          assert '$$' not in sedfix, '::error:: sedfix 含 $$ 锚点，make 双重展开会吃掉'
+          assert s.count(oldcfg) == 2, '::error:: busybox 二次 oldconfig 未写入'
+          assert s.count(postfix) == 1, '::error:: busybox autoconf.h 兜底未写入'
+          assert s.count(check2) == 1, '::error:: busybox EXTRA_COMPAT 断言未写入'
+          for name, line in [('sedfix', sedfix), ('postfix', postfix),
+                             ('diag', diag), ('check1', check1), ('check2', check2)]:
+              assert '$$' not in line, '::error:: ' + name + ' 含 $$ 锚点，make 双重展开会吃掉'
           assert '=y$$/' not in s, '::error:: busybox Makefile 残留 v8 的 $$ 锚点'
           assert '-Wno-error=deprecated-declarations' in s, '::error:: 编译标志兜底未写入'
           open(p, 'w', encoding='utf-8', newline='\n').write(s)
-          print('busybox: 三层修复已写入（主配置 + 双段 sed + -Wno-error）')
+          print('busybox: 四项四层修复已写入（主配置 + 双段 sed + kconfig 重生成 + -Wno-error）')
           PY
           echo "=== 注入后 Makefile 的关键行 ==="
-          grep -nE 'EXTRA_CFLAGS=|Wno-error|CONFIG_WERROR|CONFIG_SELINUX|CONFIG_PAM|oldconfig' "${OW}/package/utils/busybox/Makefile" | head -20
+          grep -nE 'EXTRA_CFLAGS=|Wno-error|CONFIG_WERROR|CONFIG_SELINUX|CONFIG_PAM|EXTRA_COMPAT|autoconf|oldconfig' "${OW}/package/utils/busybox/Makefile" | head -30
 
       # 防线一：确认设备 / 文件系统 / NSS 关键包，不对就停工。
       # LibWrt 的 target-metadata.pl 生成 CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2，
@@ -588,21 +631,25 @@ jobs:
           # 单包目标不走 toolchain/install，staging_dir/toolchain-*/lib/ 下还没有
           # libgcc_s.so.*，会先挂在 package/libs/toolchain（cp: cannot stat ...）。
           # 完整 `make world` 才会按依赖链把工具链装好；run #4/#5 已证明能走到 busybox。
-          # 这里只做零成本静态自检，确认三层修复都在，避免再空跑 2 小时。
-          echo "=== busybox 三层修复静态自检（不触发编译）==="
+          # 这里只做零成本静态自检，确认四层修复都在，避免再空跑 2 小时。
+          echo "=== busybox 四项四层修复静态自检（不触发编译）==="
           BAD=0
-          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=y' .config; then
-            echo "::error:: 主 .config 仍有 busybox WERROR/SELINUX/PAM = y"; BAD=1
+          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM|EXTRA_COMPAT)=y' .config; then
+            echo "::error:: 主 .config 仍有 busybox WERROR/SELINUX/PAM/EXTRA_COMPAT = y"; BAD=1
           fi
           BBMK=package/utils/busybox/Makefile
           grep -Fq 's/^CONFIG_WERROR=y.*/' "$BBMK" || { echo "::error:: busybox Makefile 缺少 v9 无锚点 sed"; BAD=1; }
           [ "$(grep -Fc 's/^CONFIG_WERROR=y.*/' "$BBMK")" -eq 2 ] || { echo "::error:: busybox 双段 sed 数量不对"; BAD=1; }
+          grep -Fq 's/^CONFIG_EXTRA_COMPAT=y.*/' "$BBMK" || { echo "::error:: busybox Makefile 缺少 EXTRA_COMPAT sed"; BAD=1; }
+          [ "$(grep -Fc 's/^CONFIG_EXTRA_COMPAT=y.*/' "$BBMK")" -eq 2 ] || { echo "::error:: busybox EXTRA_COMPAT sed 数量不对"; BAD=1; }
+          grep -Fq '#define ENABLE_EXTRA_COMPAT 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 autoconf.h 兜底"; BAD=1; }
+          grep -Fq 'ENABLE_EXTRA_COMPAT 不是 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 EXTRA_COMPAT 断言"; BAD=1; }
           if grep -Fq '=y$$/' "$BBMK"; then echo '::error:: 残留 v8 的 $$ 锚点，make 双重展开会吃掉'; BAD=1; fi
           grep -Fq -- '-Wno-error=deprecated-declarations' "$BBMK" || { echo "::error:: busybox Makefile 缺少 -Wno-error 兜底"; BAD=1; }
           if [ "$BAD" -ne 0 ]; then
             echo "::error:: busybox 修复自检未通过，终止（避免空跑 2 小时）"; exit 1
           fi
-          echo "  ① 主 .config 三项已关  ② oldconfig 后双段 sed 就位  ③ -Wno-error 兜底就位"
+          echo "  ① 主 .config 四项已关  ② 双段 sed(含 EXTRA_COMPAT)  ③ kconfig 重生成 + autoconf.h 按 0  ④ -Wno-error"
           # 保留原来的「并行失败后 -j1 V=s 重跑」逻辑，同时把两份输出留档：
           # 失败时只上传末尾若干行，避免以后还要手动复制几万行日志。
           if ! make -j"$(nproc)" 2>&1 | tee build-parallel.log; then
@@ -743,7 +790,9 @@ jobs:
         with:
           tag_name: znm2-612nss-latest
           name: ZN-M2 6.12.116 NSS run${{ github.run_number }}
-          overwrite: true
+          # v2 已无 overwrite 输入（actionlint 实测报错）。v2 对同名资产默认覆盖
+          # （action.yml: overwrite_files 默认 true），因此不传任何覆盖类输入，
+          # 兼容 v2 所有小版本；固件文件名不含 run 号，靠默认覆盖实现滚动发布。
           body_path: ${{ github.workspace }}/BUILD-REPORT.txt
           files: |
             ${{ github.workspace }}/openwrt/bin/targets/qualcommax/ipq60xx/*zn_m2*
