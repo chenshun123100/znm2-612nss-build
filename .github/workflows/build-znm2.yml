@@ -13,6 +13,7 @@ name: Build ZN-M2 (LibWrt 25.12-nss / Linux 6.12.116 / NSS)
 #   - CPU 编译期解锁 1.6/1.8GHz（放宽 OPP speedbin 位图）+ 可选开机定频
 #   - 首次开机把 LAN 预置为 192.168.9.1（避开光猫）
 #   - 保留 WiFi(ath11k+板级校准) / USB3.0 / 满血 NSS 11.4 / opkg
+# 2026-11-15 v7：busybox 三层硬修复（run #5 证明 oldconfig 会冲掉前置注入）+ 预编译止损。
 # 2026-11-14 定稿（用户最终口径）：
 #   - 不内置路由狗 NAS 界面（用户明确取消）；只保留 iStore 商店 + Argon 主题
 #   - 包管理器确定为 opkg / .ipk：seed 写 "# CONFIG_USE_APK is not set"，
@@ -385,35 +386,50 @@ jobs:
           echo "=== 实际选中的 wpad 变体 ==="
           grep -E '^CONFIG_PACKAGE_wpad[^=]*=y' .config || true
           # ------------------------------------------------------------------
-          # run #4 实测失败：
-          #   include/libbb.h:1741: error: 'security_context_t' is deprecated
-          #   [-Werror=deprecated-declarations]
-          #   ERROR: package/utils/busybox failed to build (build variant: default)
-          # 根因：这份 .config 把 busybox 的 WERROR / SELINUX / PAM 全开成 y
-          # （日志里 LDLIBS="pam pam_misc pthread" 可为证），新版 libselinux
-          # 头文件把 security_context_t 标为 deprecated，叠加 busybox 的
-          # -Werror 就把警告变成致命错误。与定制软件包无关，是基础包。
-          # 上游 package/utils/busybox/Config-defaults.in 里这三项本就 default n，
-          # 所以这里在 busybox 自己的 .config 里显式写 n 是顺着默认值，不会被翻回。
-          # 位置很关键：必须写在 Makefile 的 grep 之后、oldconfig 之前，
-          # 让后写入的值覆盖主 .config 传进来的 =y。
+          # busybox 1.37.0 / security_context_t deprecated + -Werror（run #4 / #5）
+          # run #5 证明「只在 oldconfig 之前追加 # CONFIG_X is not set」无效：
+          #   Makefile 行号 178→181 说明三行注入确实执行了，但 oldconfig 会重写
+          #   $(PKG_BUILD_DIR)/.config，把后追加的关闭行冲掉；日志里
+          #   LDLIBS="pam pam_misc pthread" 与 -Werror 依旧，三项仍是 y。
+          # 三层修复，任何一层生效都不会再挂：
+          #   1) 主 .config 源头关掉 CONFIG_BUSYBOX_{DEFAULT|CONFIG}_{WERROR,SELINUX,PAM}
+          #      （LDLIBS / PKG_BUILD_DEPENDS 读的是主 .config，不是 busybox 内部 .config）
+          #   2) busybox 的 Build/Configure 在 oldconfig 之后再 sed 一次（决定性）
+          #   3) MAKE_FLAGS 的 EXTRA_CFLAGS 追加 -Wno-error=deprecated-declarations
+          #      —— 即使前两层全失效，deprecated 也只是警告，不会变致命错误
+          # 另：Build 步骤先单独编 busybox，修复无效几分钟内停工，不再空跑 2 小时。
+          sed -i -E 's/^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=y$/# CONFIG_BUSYBOX_\1_\2 is not set/' .config
+          echo "=== 主 .config 里的 busybox 关键项（应全部 is not set）==="
+          grep -E '^# CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM) is not set|^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=' .config || true
+          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=y' .config; then
+            echo "::error:: busybox WERROR/SELINUX/PAM 仍为 y，拒绝继续"; exit 1
+          fi
           python3 - "${OW}/package/utils/busybox/Makefile" <<'PY'
           import sys
           p = sys.argv[1]
           s = open(p, encoding='utf-8').read()
-          needle = "\tyes 'n' | $(MAKE) -C $(PKG_BUILD_DIR) $(MAKE_FLAGS) oldconfig"
-          assert needle in s, '::error:: busybox Makefile 结构变化，拒绝盲目编译'
-          fix = ("\techo '# CONFIG_WERROR is not set' >> $(PKG_BUILD_DIR)/.config\n"
-                 "\techo '# CONFIG_SELINUX is not set' >> $(PKG_BUILD_DIR)/.config\n"
-                 "\techo '# CONFIG_PAM is not set' >> $(PKG_BUILD_DIR)/.config\n")
-          if fix not in s:
-              s = s.replace(needle, fix + needle, 1)
-          open(p, 'w', encoding='utf-8').write(s)
-          assert fix in s, '::error:: busybox 修复未写入'
-          print('busybox: WERROR / SELINUX / PAM 已强制关闭')
+
+          # 3) 编译标志兜底：deprecated 警告不升级为错误
+          cflag_old = '\tEXTRA_CFLAGS="$(TARGET_CFLAGS) $(TARGET_CPPFLAGS)" \\\n'
+          cflag_new = '\tEXTRA_CFLAGS="$(TARGET_CFLAGS) $(TARGET_CPPFLAGS) -Wno-error=deprecated-declarations" \\\n'
+          assert cflag_old in s, '::error:: busybox EXTRA_CFLAGS 结构变化，拒绝盲目编译'
+          s = s.replace(cflag_old, cflag_new, 1)
+
+          # 2) oldconfig 前后各强制一次；Makefile recipe 里的 $ 必须写成 $$
+          sedfix = ("\tsed -i -e 's/^CONFIG_WERROR=y$$/# CONFIG_WERROR is not set/' "
+                    "-e 's/^CONFIG_SELINUX=y$$/# CONFIG_SELINUX is not set/' "
+                    "-e 's/^CONFIG_PAM=y$$/# CONFIG_PAM is not set/' $(PKG_BUILD_DIR)/.config")
+          oldcfg = "\tyes 'n' | $(MAKE) -C $(PKG_BUILD_DIR) $(MAKE_FLAGS) oldconfig"
+          assert oldcfg in s, '::error:: busybox oldconfig 结构变化，拒绝盲目编译'
+          if sedfix not in s:
+              s = s.replace(oldcfg, sedfix + "\n" + oldcfg + "\n" + sedfix, 1)
+          assert s.count(sedfix) == 2, '::error:: busybox 双段 sed 未写入'
+          assert '-Wno-error=deprecated-declarations' in s, '::error:: 编译标志兜底未写入'
+          open(p, 'w', encoding='utf-8', newline='\n').write(s)
+          print('busybox: 三层修复已写入（主配置 + 双段 sed + -Wno-error）')
           PY
-          echo "=== 主 .config 里的 busybox 关键项 ==="
-          grep -E 'CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)' .config || true
+          echo "=== 注入后 Makefile 的关键行 ==="
+          grep -nE 'EXTRA_CFLAGS=|Wno-error|CONFIG_WERROR|CONFIG_SELINUX|CONFIG_PAM|oldconfig' "${OW}/package/utils/busybox/Makefile" | head -20
 
       # 防线一：确认设备 / 文件系统 / NSS 关键包，不对就停工。
       # LibWrt 的 target-metadata.pl 生成 CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2，
@@ -559,6 +575,19 @@ jobs:
         run: |
           cd "${GITHUB_WORKSPACE}/openwrt"
           set -o pipefail
+          # run #4/#5 都挂在 busybox，先单独编它：修复无效时几分钟内暴露，
+          # 不再空跑 2 小时；成功则后续 world 直接复用 stamp，不重复编译。
+          echo "=== 预编译 busybox（验证 WERROR/SELINUX/PAM 修复）==="
+          if ! make package/utils/busybox/compile V=s -j"$(nproc)" 2>&1 | tee build-busybox.log; then
+            echo "::warning:: busybox 预编译失败，判断是不是 -Werror 那类问题"
+            if grep -qE 'security_context_t|deprecated-declarations|Werror|busybox failed to build' build-busybox.log; then
+              echo "::error:: 确认仍是 busybox -Werror / deprecated 问题，终止（避免空跑 2 小时）"
+              tail -n 80 build-busybox.log
+              exit 1
+            fi
+            echo "::warning:: 不是 -Werror 问题（可能只是工具链尚未就绪），继续完整 world，由后续编译自然暴露"
+          fi
+          echo "=== busybox 预编译通过，继续完整 world ==="
           # 保留原来的「并行失败后 -j1 V=s 重跑」逻辑，同时把两份输出留档：
           # 失败时只上传末尾若干行，避免以后还要手动复制几万行日志。
           if ! make -j"$(nproc)" 2>&1 | tee build-parallel.log; then
@@ -575,6 +604,8 @@ jobs:
         run: |
           cd "${GITHUB_WORKSPACE}/openwrt"
           {
+            echo "===== busybox 预编译（末尾 150 行） ====="
+            tail -n 150 build-busybox.log 2>/dev/null || true
             echo "===== make -j (末尾 100 行) ====="
             tail -n 100 build-parallel.log 2>/dev/null || true
             echo "===== make -j1 V=s (末尾 400 行) ====="
