@@ -13,9 +13,9 @@ name: Build ZN-M2 (LibWrt 25.12-nss / Linux 6.12.116 / NSS)
 #   - CPU 编译期解锁 1.6/1.8GHz（放宽 OPP speedbin 位图）+ 可选开机定频
 #   - 首次开机把 LAN 预置为 192.168.9.1（避开光猫）
 #   - 保留 WiFi(ath11k+板级校准) / USB3.0 / 满血 NSS 11.4 / opkg
-# 2026-11-15 v8：busybox 三层硬修复保留；撤销 v7 的「单独预编译 busybox」——
-#     run #6 证明单包目标不走 toolchain/install，会先挂在 package/libs/toolchain。
-#     改为 Build 开头零成本静态自检 + 完整 make world（run #4/#5 已验证的路径）。
+# 2026-11-15 v9：busybox 第②层 sed 改成完全不含 $ 的写法（run #7 证明
+#     define + $(eval) 双重展开会把 '=y$$/' 吃成 '=y'，sed 报 unterminated s）。
+#     主 .config 防线 + -Wno-error 兜底 + Build 静态自检 + 完整 make world 均保留。
 # 2026-11-14 定稿（用户最终口径）：
 #   - 不内置路由狗 NAS 界面（用户明确取消）；只保留 iStore 商店 + Argon 主题
 #   - 包管理器确定为 opkg / .ipk：seed 写 "# CONFIG_USE_APK is not set"，
@@ -399,7 +399,7 @@ jobs:
           #   2) busybox 的 Build/Configure 在 oldconfig 之后再 sed 一次（决定性）
           #   3) MAKE_FLAGS 的 EXTRA_CFLAGS 追加 -Wno-error=deprecated-declarations
           #      —— 即使前两层全失效，deprecated 也只是警告，不会变致命错误
-          # 另：Build 步骤先单独编 busybox，修复无效几分钟内停工，不再空跑 2 小时。
+          # 另：Build 开头做零成本静态自检（不触发编译），确认三层修复都在再开编。
           sed -i -E 's/^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=y$/# CONFIG_BUSYBOX_\1_\2 is not set/' .config
           echo "=== 主 .config 里的 busybox 关键项（应全部 is not set）==="
           grep -E '^# CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM) is not set|^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=' .config || true
@@ -417,15 +417,22 @@ jobs:
           assert cflag_old in s, '::error:: busybox EXTRA_CFLAGS 结构变化，拒绝盲目编译'
           s = s.replace(cflag_old, cflag_new, 1)
 
-          # 2) oldconfig 前后各强制一次；Makefile recipe 里的 $ 必须写成 $$
-          sedfix = ("\tsed -i -e 's/^CONFIG_WERROR=y$$/# CONFIG_WERROR is not set/' "
-                    "-e 's/^CONFIG_SELINUX=y$$/# CONFIG_SELINUX is not set/' "
-                    "-e 's/^CONFIG_PAM=y$$/# CONFIG_PAM is not set/' $(PKG_BUILD_DIR)/.config")
+          # 2) oldconfig 前后各强制一次。
+          #    run #7 实测：recipe 里写 '$$' 不够 —— define + $(eval) 会让 make
+          #    **展开两次**：第一次 $$ -> $，第二次 $/ 被当成「名为 / 的变量」吃掉，
+          #    最终 shell 收到 's/^CONFIG_WERROR=y# CONFIG_WERROR is not set/'
+          #    （sed: unterminated `s' command）。所以彻底不用 $ 行尾锚点，
+          #    改用 '.*' 吞掉行尾；整条命令不含任何裸 $，双重展开也伤不到。
+          sedfix = ("\tsed -i -e 's/^CONFIG_WERROR=y.*/# CONFIG_WERROR is not set/' "
+                    "-e 's/^CONFIG_SELINUX=y.*/# CONFIG_SELINUX is not set/' "
+                    "-e 's/^CONFIG_PAM=y.*/# CONFIG_PAM is not set/' $(PKG_BUILD_DIR)/.config")
           oldcfg = "\tyes 'n' | $(MAKE) -C $(PKG_BUILD_DIR) $(MAKE_FLAGS) oldconfig"
           assert oldcfg in s, '::error:: busybox oldconfig 结构变化，拒绝盲目编译'
           if sedfix not in s:
               s = s.replace(oldcfg, sedfix + "\n" + oldcfg + "\n" + sedfix, 1)
           assert s.count(sedfix) == 2, '::error:: busybox 双段 sed 未写入'
+          assert '$$' not in sedfix, '::error:: sedfix 含 $$ 锚点，make 双重展开会吃掉'
+          assert '=y$$/' not in s, '::error:: busybox Makefile 残留 v8 的 $$ 锚点'
           assert '-Wno-error=deprecated-declarations' in s, '::error:: 编译标志兜底未写入'
           open(p, 'w', encoding='utf-8', newline='\n').write(s)
           print('busybox: 三层修复已写入（主配置 + 双段 sed + -Wno-error）')
@@ -588,8 +595,9 @@ jobs:
             echo "::error:: 主 .config 仍有 busybox WERROR/SELINUX/PAM = y"; BAD=1
           fi
           BBMK=package/utils/busybox/Makefile
-          grep -Fq 's/^CONFIG_WERROR=y' "$BBMK" || { echo "::error:: busybox Makefile 缺少 oldconfig 后 sed"; BAD=1; }
-          [ "$(grep -Fc 's/^CONFIG_WERROR=y' "$BBMK")" -eq 2 ] || { echo "::error:: busybox 双段 sed 数量不对"; BAD=1; }
+          grep -Fq 's/^CONFIG_WERROR=y.*/' "$BBMK" || { echo "::error:: busybox Makefile 缺少 v9 无锚点 sed"; BAD=1; }
+          [ "$(grep -Fc 's/^CONFIG_WERROR=y.*/' "$BBMK")" -eq 2 ] || { echo "::error:: busybox 双段 sed 数量不对"; BAD=1; }
+          if grep -Fq '=y$$/' "$BBMK"; then echo '::error:: 残留 v8 的 $$ 锚点，make 双重展开会吃掉'; BAD=1; fi
           grep -Fq -- '-Wno-error=deprecated-declarations' "$BBMK" || { echo "::error:: busybox Makefile 缺少 -Wno-error 兜底"; BAD=1; }
           if [ "$BAD" -ne 0 ]; then
             echo "::error:: busybox 修复自检未通过，终止（避免空跑 2 小时）"; exit 1
