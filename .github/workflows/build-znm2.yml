@@ -384,6 +384,36 @@ jobs:
           fi
           echo "=== 实际选中的 wpad 变体 ==="
           grep -E '^CONFIG_PACKAGE_wpad[^=]*=y' .config || true
+          # ------------------------------------------------------------------
+          # run #4 实测失败：
+          #   include/libbb.h:1741: error: 'security_context_t' is deprecated
+          #   [-Werror=deprecated-declarations]
+          #   ERROR: package/utils/busybox failed to build (build variant: default)
+          # 根因：这份 .config 把 busybox 的 WERROR / SELINUX / PAM 全开成 y
+          # （日志里 LDLIBS="pam pam_misc pthread" 可为证），新版 libselinux
+          # 头文件把 security_context_t 标为 deprecated，叠加 busybox 的
+          # -Werror 就把警告变成致命错误。与定制软件包无关，是基础包。
+          # 上游 package/utils/busybox/Config-defaults.in 里这三项本就 default n，
+          # 所以这里在 busybox 自己的 .config 里显式写 n 是顺着默认值，不会被翻回。
+          # 位置很关键：必须写在 Makefile 的 grep 之后、oldconfig 之前，
+          # 让后写入的值覆盖主 .config 传进来的 =y。
+          python3 - "${OW}/package/utils/busybox/Makefile" <<'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p, encoding='utf-8').read()
+          needle = "\tyes 'n' | $(MAKE) -C $(PKG_BUILD_DIR) $(MAKE_FLAGS) oldconfig"
+          assert needle in s, '::error:: busybox Makefile 结构变化，拒绝盲目编译'
+          fix = ("\techo '# CONFIG_WERROR is not set' >> $(PKG_BUILD_DIR)/.config\n"
+                 "\techo '# CONFIG_SELINUX is not set' >> $(PKG_BUILD_DIR)/.config\n"
+                 "\techo '# CONFIG_PAM is not set' >> $(PKG_BUILD_DIR)/.config\n")
+          if fix not in s:
+              s = s.replace(needle, fix + needle, 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          assert fix in s, '::error:: busybox 修复未写入'
+          print('busybox: WERROR / SELINUX / PAM 已强制关闭')
+          PY
+          echo "=== 主 .config 里的 busybox 关键项 ==="
+          grep -E 'CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)' .config || true
 
       # 防线一：确认设备 / 文件系统 / NSS 关键包，不对就停工。
       # LibWrt 的 target-metadata.pl 生成 CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2，
@@ -447,6 +477,7 @@ jobs:
         with:
           name: znm2-defconfig-run${{ github.run_number }}
           path: ${{ github.workspace }}/openwrt/.config
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
 
@@ -527,7 +558,37 @@ jobs:
       - name: Build
         run: |
           cd "${GITHUB_WORKSPACE}/openwrt"
-          make -j"$(nproc)" || make -j1 V=s
+          set -o pipefail
+          # 保留原来的「并行失败后 -j1 V=s 重跑」逻辑，同时把两份输出留档：
+          # 失败时只上传末尾若干行，避免以后还要手动复制几万行日志。
+          if ! make -j"$(nproc)" 2>&1 | tee build-parallel.log; then
+            echo "=== 并行编译失败，改用 -j1 V=s 重跑 ==="
+            if ! make -j1 V=s 2>&1 | tee build-serial.log; then
+              echo "=== 串行编译末尾 120 行 ==="
+              tail -n 120 build-serial.log
+              exit 1
+            fi
+          fi
+
+      - name: Save build failure tail
+        if: failure()
+        run: |
+          cd "${GITHUB_WORKSPACE}/openwrt"
+          {
+            echo "===== make -j (末尾 100 行) ====="
+            tail -n 100 build-parallel.log 2>/dev/null || true
+            echo "===== make -j1 V=s (末尾 400 行) ====="
+            tail -n 400 build-serial.log 2>/dev/null || true
+          } > "${GITHUB_WORKSPACE}/build-tail.log"
+
+      - name: Upload build failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: znm2-build-tail-run${{ github.run_number }}
+          path: ${{ github.workspace }}/build-tail.log
+          if-no-files-found: warn
+          retention-days: 7
 
       # 防线二：必须有 zn_m2 的 squashfs-sysupgrade，且 root 卷不超过
       # UBI 硬上限（ubi0 93.4MiB 扣 kernel ~5.3MiB ≈ 88MiB），否则拒绝发布。
