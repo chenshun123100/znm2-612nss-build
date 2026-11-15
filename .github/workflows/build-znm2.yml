@@ -13,7 +13,9 @@ name: Build ZN-M2 (LibWrt 25.12-nss / Linux 6.12.116 / NSS)
 #   - CPU 编译期解锁 1.6/1.8GHz（放宽 OPP speedbin 位图）+ 可选开机定频
 #   - 首次开机把 LAN 预置为 192.168.9.1（避开光猫）
 #   - 保留 WiFi(ath11k+板级校准) / USB3.0 / 满血 NSS 11.4 / opkg
-# 2026-11-15 v7：busybox 三层硬修复（run #5 证明 oldconfig 会冲掉前置注入）+ 预编译止损。
+# 2026-11-15 v8：busybox 三层硬修复保留；撤销 v7 的「单独预编译 busybox」——
+#     run #6 证明单包目标不走 toolchain/install，会先挂在 package/libs/toolchain。
+#     改为 Build 开头零成本静态自检 + 完整 make world（run #4/#5 已验证的路径）。
 # 2026-11-14 定稿（用户最终口径）：
 #   - 不内置路由狗 NAS 界面（用户明确取消）；只保留 iStore 商店 + Argon 主题
 #   - 包管理器确定为 opkg / .ipk：seed 写 "# CONFIG_USE_APK is not set"，
@@ -575,19 +577,24 @@ jobs:
         run: |
           cd "${GITHUB_WORKSPACE}/openwrt"
           set -o pipefail
-          # run #4/#5 都挂在 busybox，先单独编它：修复无效时几分钟内暴露，
-          # 不再空跑 2 小时；成功则后续 world 直接复用 stamp，不重复编译。
-          echo "=== 预编译 busybox（验证 WERROR/SELINUX/PAM 修复）==="
-          if ! make package/utils/busybox/compile V=s -j"$(nproc)" 2>&1 | tee build-busybox.log; then
-            echo "::warning:: busybox 预编译失败，判断是不是 -Werror 那类问题"
-            if grep -qE 'security_context_t|deprecated-declarations|Werror|busybox failed to build' build-busybox.log; then
-              echo "::error:: 确认仍是 busybox -Werror / deprecated 问题，终止（避免空跑 2 小时）"
-              tail -n 80 build-busybox.log
-              exit 1
-            fi
-            echo "::warning:: 不是 -Werror 问题（可能只是工具链尚未就绪），继续完整 world，由后续编译自然暴露"
+          # run #6 教训：绝不能单独跑 `make package/utils/busybox/compile`。
+          # 单包目标不走 toolchain/install，staging_dir/toolchain-*/lib/ 下还没有
+          # libgcc_s.so.*，会先挂在 package/libs/toolchain（cp: cannot stat ...）。
+          # 完整 `make world` 才会按依赖链把工具链装好；run #4/#5 已证明能走到 busybox。
+          # 这里只做零成本静态自检，确认三层修复都在，避免再空跑 2 小时。
+          echo "=== busybox 三层修复静态自检（不触发编译）==="
+          BAD=0
+          if grep -qE '^CONFIG_BUSYBOX_(DEFAULT|CONFIG)_(WERROR|SELINUX|PAM)=y' .config; then
+            echo "::error:: 主 .config 仍有 busybox WERROR/SELINUX/PAM = y"; BAD=1
           fi
-          echo "=== busybox 预编译通过，继续完整 world ==="
+          BBMK=package/utils/busybox/Makefile
+          grep -Fq 's/^CONFIG_WERROR=y' "$BBMK" || { echo "::error:: busybox Makefile 缺少 oldconfig 后 sed"; BAD=1; }
+          [ "$(grep -Fc 's/^CONFIG_WERROR=y' "$BBMK")" -eq 2 ] || { echo "::error:: busybox 双段 sed 数量不对"; BAD=1; }
+          grep -Fq -- '-Wno-error=deprecated-declarations' "$BBMK" || { echo "::error:: busybox Makefile 缺少 -Wno-error 兜底"; BAD=1; }
+          if [ "$BAD" -ne 0 ]; then
+            echo "::error:: busybox 修复自检未通过，终止（避免空跑 2 小时）"; exit 1
+          fi
+          echo "  ① 主 .config 三项已关  ② oldconfig 后双段 sed 就位  ③ -Wno-error 兜底就位"
           # 保留原来的「并行失败后 -j1 V=s 重跑」逻辑，同时把两份输出留档：
           # 失败时只上传末尾若干行，避免以后还要手动复制几万行日志。
           if ! make -j"$(nproc)" 2>&1 | tee build-parallel.log; then
@@ -604,8 +611,6 @@ jobs:
         run: |
           cd "${GITHUB_WORKSPACE}/openwrt"
           {
-            echo "===== busybox 预编译（末尾 150 行） ====="
-            tail -n 150 build-busybox.log 2>/dev/null || true
             echo "===== make -j (末尾 100 行) ====="
             tail -n 100 build-parallel.log 2>/dev/null || true
             echo "===== make -j1 V=s (末尾 400 行) ====="
