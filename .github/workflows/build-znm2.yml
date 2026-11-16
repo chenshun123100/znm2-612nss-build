@@ -673,7 +673,7 @@ jobs:
           grep -Fq '#define ENABLE_FEATURE_INETD_RPC 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 ENABLE_INETD_RPC 兜底"; BAD=1; }
           grep -Fq '#define ENABLE_FEATURE_MOUNT_NFS 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 ENABLE_MOUNT_NFS 兜底"; BAD=1; }
           grep -Fq 'ENABLE_EXTRA_COMPAT 0' "$BBMK" || { echo "::error:: busybox Makefile 缺少 EXTRA_COMPAT 断言"; BAD=1; }
-          grep -Fq 'ENABLE_\* 宏仍有 1' "$BBMK" || { echo "::error:: busybox Makefile 缺少 ENABLE_* 断言"; BAD=1; }
+          grep -Fq 'ENABLE_* 宏仍有 1' "$BBMK" || { echo "::error:: busybox Makefile 缺少 ENABLE_* 断言"; BAD=1; }
           if grep -Fq '=y$$/' "$BBMK"; then echo '::error:: 残留 v8 的 $$ 锚点，make 双重展开会吃掉'; BAD=1; fi
           grep -Fq -- '-Wno-error=deprecated-declarations' "$BBMK" || { echo "::error:: busybox Makefile 缺少 -Wno-error 兜底"; BAD=1; }
           if [ "$BAD" -ne 0 ]; then
