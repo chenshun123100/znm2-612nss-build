@@ -675,7 +675,9 @@ jobs:
           #   本 workflow 与上游 Makefile 都不写这些标志，属外部注入。
           # 处理：make 之前统一清洗 CFLAGS/LDFLAGS 及 busybox Makefile 残留，
           #   并加硬断言；清洗只去掉 sanitizer / -O0 调试项，不动 -Os/-pipe 等正常优化。
-          for v in CFLAGS CXXFLAGS CPPFLAGS LDFLAGS EXTRA_CFLAGS EXTRA_LDFLAGS; do
+          # MAKEFLAGS 也在清洗列表里：make 命令行变量优先级高于 Makefile 内定义，
+          # 若 MAKEFLAGS 带 CFLAGS=-fsanitize 会覆盖一切，且旧断言从未检查它。
+          for v in CFLAGS CXXFLAGS CPPFLAGS LDFLAGS EXTRA_CFLAGS EXTRA_LDFLAGS MAKEFLAGS; do
             eval "old=\${$v:-}"
             new=$(printf '%s' "$old" | sed -E \
               -e 's/-f(no)?sanitize=[^ ]+//g' \
@@ -685,19 +687,54 @@ jobs:
             export "$v=$new"
           done
           sed -i -E 's/-f(no)?sanitize=[^ ]+//g; s/(^|[[:space:]])-O0([[:space:]]|$)/ /g' package/utils/busybox/Makefile
-          # .config 侧兜底：若 CONFIG_TARGET_OPTIMIZATION / CONFIG_EXTRA_* 带 sanitizer，
-          # 它会被 TARGET_CFLAGS 带进 EXTRA_LDFLAGS，同样在链接期炸。
-          if grep -qE '^CONFIG_(TARGET_OPTIMIZATION|EXTRA_CFLAGS|EXTRA_LDFLAGS)=' .config; then
-            sed -i -E '/^CONFIG_(TARGET_OPTIMIZATION|EXTRA_CFLAGS|EXTRA_LDFLAGS)=/ s/-f(no)?sanitize=[^ "]+//g; /^CONFIG_(TARGET_OPTIMIZATION|EXTRA_CFLAGS|EXTRA_LDFLAGS)=/ s/(^|=")-O0([ "]|$)/\1\2/g' .config
-          fi
+          # .config 侧兜底：只清 sanitizer（这个正则已实测有效）。
+          # -g/-O0 交给下面 make 的 filter-out 处理——实测证明 sed 在带引号的
+          # CONFIG_X="..." 行里清 -g/-O0 容易误伤/漏清，不在此处冒风险。
+          sed -i -E '/^CONFIG_[A-Za-z0-9_]+=/ s/-f(no)?sanitize=[^ "]+//g' .config
           echo "=== 清洗后的构建标志（应无 -fsanitize / -O0）==="
-          env | grep -E '^(CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|EXTRA_CFLAGS|EXTRA_LDFLAGS)=' || true
-          if env | grep -E '(CFLAGS|LDFLAGS)=.*-fsanitize'; then
-            echo "::error:: 环境变量仍有 -fsanitize 残留，musl 工具链无法链接"; exit 1
+          env | grep -E '^(CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|EXTRA_CFLAGS|EXTRA_LDFLAGS|MAKEFLAGS)=' || true
+          if env | grep -E '(CFLAGS|LDFLAGS|MAKEFLAGS)=.*-fsanitize'; then
+            echo "::error:: 环境变量(含 MAKEFLAGS)仍有 -fsanitize 残留，musl 工具链无法链接"; exit 1
           fi
           if grep -q -- '-fsanitize' package/utils/busybox/Makefile; then
             echo "::error:: busybox Makefile 仍有 -fsanitize 残留"; exit 1
           fi
+          # ---- run #13 复盘：shell 层清洗无效，改在"最后一公里"用 make 自身过滤 ----
+          # 证据：run #13 用的就是带上面清洗的 commit，硬断言通过(说明 env 干净)，
+          #   但 LINK 命令仍带 -g -O0 -fsanitize。这些标志不在 shell 环境里，
+          #   而是 make 从 .config 重新组装 TARGET_CFLAGS/TARGET_CPPFLAGS/LDFLAGS 后再
+          #   经 package/utils/busybox/Makefile 的 EXTRA_CFLAGS/EXTRA_LDFLAGS 传入。
+          # 兜底：无论注入源在哪，最终都要经过 busybox 包 Makefile 的 MAKE_FLAGS。
+          #   在那一行用 make 的 $(filter-out) 把 sanitizer/-O0/-g 直接剔掉，
+          #   这是 make 变量求值，优先级高于任何环境变量或 .config 注入。
+          python3 - <<'PY'
+          p = "package/utils/busybox/Makefile"
+          s = open(p, encoding="utf-8").read()
+          # 1) 在 MAKE_VARS := 处插入四个已过滤变量的定义
+          head_old = "MAKE_VARS :="
+          head_new = (
+              "BB_CLEAN_CFLAGS := $(filter-out -fsanitize% -O0 -g,$(TARGET_CFLAGS))\n"
+              "BB_CLEAN_CPPFLAGS := $(filter-out -fsanitize% -O0 -g,$(TARGET_CPPFLAGS))\n"
+              "BB_CLEAN_LDFLAGS := $(filter-out -fsanitize% -O0 -g,$(TARGET_LDFLAGS))\n"
+              "BB_CLEAN_LDLIBS := $(filter-out -fsanitize% -O0 -g,$(LDLIBS))\n"
+              "MAKE_VARS :="
+          )
+          assert head_old in s, "::error:: busybox MAKE_VARS 锚点消失，拒绝盲目编译"
+          if "BB_CLEAN_CFLAGS :=" not in s:
+              s = s.replace(head_old, head_new, 1)
+          # 2) 把 MAKE_FLAGS 里的引用换成过滤后的变量
+          s = s.replace('EXTRA_CFLAGS="$(TARGET_CFLAGS) $(TARGET_CPPFLAGS)"',
+                        'EXTRA_CFLAGS="$(BB_CLEAN_CFLAGS) $(BB_CLEAN_CPPFLAGS)"')
+          s = s.replace('EXTRA_LDFLAGS="$(TARGET_LDFLAGS) $(TARGET_CFLAGS)"',
+                        'EXTRA_LDFLAGS="$(BB_CLEAN_LDFLAGS) $(BB_CLEAN_CFLAGS)"')
+          s = s.replace('LDLIBS="$(LDLIBS)"', 'LDLIBS="$(BB_CLEAN_LDLIBS)"')
+          assert "BB_CLEAN_CFLAGS)" in s and "BB_CLEAN_CPPFLAGS)\"" in s, \
+              "::error:: busybox MAKE_FLAGS 替换失败，拒绝盲目编译"
+          open(p, "w", encoding="utf-8", newline="\n").write(s)
+          print("busybox: 已在传参处用 filter-out 剔除 sanitizer/-O0/-g（不依赖注入源）")
+          PY
+          echo "=== 复核 busybox 传参（应全是 BB_CLEAN_*）==="
+          grep -nE 'BB_CLEAN|EXTRA_CFLAGS=|EXTRA_LDFLAGS=|LDLIBS=' package/utils/busybox/Makefile | head -20
           # run #6 教训：绝不能单独跑 `make package/utils/busybox/compile`。
           # 单包目标不走 toolchain/install，staging_dir/toolchain-*/lib/ 下还没有
           # libgcc_s.so.*，会先挂在 package/libs/toolchain（cp: cannot stat ...）。
