@@ -665,6 +665,39 @@ jobs:
         run: |
           cd "${GITHUB_WORKSPACE}/openwrt"
           set -o pipefail
+          # ---- run #13 第七颗雷：链接期 libsanitizer.spec 缺失 --------------------
+          # 症状：所有 busybox .c 都编过，最后 LINK busybox_unstripped 报
+          #   aarch64-openwrt-linux-musl-gcc: fatal error: cannot read spec file
+          #   'libsanitizer.spec': No such file or directory
+          # 根因：构建环境（runner env / 被污染的缓存）往 CFLAGS/LDFLAGS 注入了
+          #   -g -O0 -fsanitize=address -fsanitize=leak -fsanitize=undefined，
+          #   而 musl 交叉工具链不含 libsanitizer.spec / libasan 运行库。
+          #   本 workflow 与上游 Makefile 都不写这些标志，属外部注入。
+          # 处理：make 之前统一清洗 CFLAGS/LDFLAGS 及 busybox Makefile 残留，
+          #   并加硬断言；清洗只去掉 sanitizer / -O0 调试项，不动 -Os/-pipe 等正常优化。
+          for v in CFLAGS CXXFLAGS CPPFLAGS LDFLAGS EXTRA_CFLAGS EXTRA_LDFLAGS; do
+            eval "old=\${$v:-}"
+            new=$(printf '%s' "$old" | sed -E \
+              -e 's/-f(no)?sanitize=[^ ]+//g' \
+              -e 's/(^| )-g3?( |$)/ /g' \
+              -e 's/(^| )-g( |$)/ /g' \
+              -e 's/(^| )-O0( |$)/ /g')
+            export "$v=$new"
+          done
+          sed -i -E 's/-f(no)?sanitize=[^ ]+//g; s/(^|[[:space:]])-O0([[:space:]]|$)/ /g' package/utils/busybox/Makefile
+          # .config 侧兜底：若 CONFIG_TARGET_OPTIMIZATION / CONFIG_EXTRA_* 带 sanitizer，
+          # 它会被 TARGET_CFLAGS 带进 EXTRA_LDFLAGS，同样在链接期炸。
+          if grep -qE '^CONFIG_(TARGET_OPTIMIZATION|EXTRA_CFLAGS|EXTRA_LDFLAGS)=' .config; then
+            sed -i -E '/^CONFIG_(TARGET_OPTIMIZATION|EXTRA_CFLAGS|EXTRA_LDFLAGS)=/ s/-f(no)?sanitize=[^ "]+//g; /^CONFIG_(TARGET_OPTIMIZATION|EXTRA_CFLAGS|EXTRA_LDFLAGS)=/ s/(^|=")-O0([ "]|$)/\1\2/g' .config
+          fi
+          echo "=== 清洗后的构建标志（应无 -fsanitize / -O0）==="
+          env | grep -E '^(CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|EXTRA_CFLAGS|EXTRA_LDFLAGS)=' || true
+          if env | grep -E '(CFLAGS|LDFLAGS)=.*-fsanitize'; then
+            echo "::error:: 环境变量仍有 -fsanitize 残留，musl 工具链无法链接"; exit 1
+          fi
+          if grep -q -- '-fsanitize' package/utils/busybox/Makefile; then
+            echo "::error:: busybox Makefile 仍有 -fsanitize 残留"; exit 1
+          fi
           # run #6 教训：绝不能单独跑 `make package/utils/busybox/compile`。
           # 单包目标不走 toolchain/install，staging_dir/toolchain-*/lib/ 下还没有
           # libgcc_s.so.*，会先挂在 package/libs/toolchain（cp: cannot stat ...）。
