@@ -707,30 +707,68 @@ jobs:
           # 兜底：无论注入源在哪，最终都要经过 busybox 包 Makefile 的 MAKE_FLAGS。
           #   在那一行用 make 的 $(filter-out) 把 sanitizer/-O0/-g 直接剔掉，
           #   这是 make 变量求值，优先级高于任何环境变量或 .config 注入。
+          # run #13 二次补丁与前面的 -Wno-error 补丁冲突：
+          # 前一段已把 EXTRA_CFLAGS 改成 "$(TARGET_CFLAGS) $(TARGET_CPPFLAGS) -Wno-error=..."，
+          # 所以这里不能再拿整行旧字面量去 replace，否则替换 0 处、断言必炸。
           python3 - <<'PY'
+          import re
           p = "package/utils/busybox/Makefile"
           s = open(p, encoding="utf-8").read()
-          # 1) 在 MAKE_VARS := 处插入四个已过滤变量的定义
+          # 1) 在 MAKE_VARS := 处插入已过滤变量；用 = 而非 :=，
+          #    避免 TARGET_CFLAGS 在这里之后才被追加而漏过滤。
           head_old = "MAKE_VARS :="
           head_new = (
-              "BB_CLEAN_CFLAGS := $(filter-out -fsanitize% -O0 -g,$(TARGET_CFLAGS))\n"
-              "BB_CLEAN_CPPFLAGS := $(filter-out -fsanitize% -O0 -g,$(TARGET_CPPFLAGS))\n"
-              "BB_CLEAN_LDFLAGS := $(filter-out -fsanitize% -O0 -g,$(TARGET_LDFLAGS))\n"
-              "BB_CLEAN_LDLIBS := $(filter-out -fsanitize% -O0 -g,$(LDLIBS))\n"
+              "BB_CLEAN_CFLAGS = $(filter-out -fsanitize% -fno-sanitize% -O0 -g%,$(TARGET_CFLAGS))\n"
+              "BB_CLEAN_CPPFLAGS = $(filter-out -fsanitize% -fno-sanitize% -O0 -g%,$(TARGET_CPPFLAGS))\n"
+              "BB_CLEAN_LDFLAGS = $(filter-out -fsanitize% -fno-sanitize% -O0 -g%,$(TARGET_LDFLAGS))\n"
+              "BB_CLEAN_LDLIBS = $(filter-out -fsanitize% -fno-sanitize% -O0 -g%,$(LDLIBS))\n"
               "MAKE_VARS :="
           )
           assert head_old in s, "::error:: busybox MAKE_VARS 锚点消失，拒绝盲目编译"
-          if "BB_CLEAN_CFLAGS :=" not in s:
+          if "BB_CLEAN_CFLAGS =" not in s:
               s = s.replace(head_old, head_new, 1)
-          # 2) 把 MAKE_FLAGS 里的引用换成过滤后的变量
-          s = s.replace('EXTRA_CFLAGS="$(TARGET_CFLAGS) $(TARGET_CPPFLAGS)"',
-                        'EXTRA_CFLAGS="$(BB_CLEAN_CFLAGS) $(BB_CLEAN_CPPFLAGS)"')
-          s = s.replace('EXTRA_LDFLAGS="$(TARGET_LDFLAGS) $(TARGET_CFLAGS)"',
-                        'EXTRA_LDFLAGS="$(BB_CLEAN_LDFLAGS) $(BB_CLEAN_CFLAGS)"')
-          s = s.replace('LDLIBS="$(LDLIBS)"', 'LDLIBS="$(BB_CLEAN_LDLIBS)"')
-          assert "BB_CLEAN_CFLAGS)" in s and "BB_CLEAN_CPPFLAGS)\"" in s, \
-              "::error:: busybox MAKE_FLAGS 替换失败，拒绝盲目编译"
+
+          # 2) 按「行内变量」重写，而不是整行匹配；保留已追加的 -Wno-error。
+          def rewrite(prefix, pairs):
+              global s
+              pat = re.compile(r'^([ \t]*' + re.escape(prefix) + r'=")([^"]*)(".*)$', re.M)
+              m = pat.search(s)
+              assert m, "::error:: busybox " + prefix + " 行消失，拒绝盲目编译"
+              old = m.group(2)
+              new = old
+              for a, b in pairs:
+                  new = new.replace(a, b)
+              if new == old:
+                  assert "BB_CLEAN_" in old, \
+                      "::error:: busybox " + prefix + " 未找到可替换的 TARGET_ 变量，拒绝盲目编译"
+              else:
+                  s = s[:m.start(2)] + new + s[m.end(2):]
+              return old, new
+
+          old_c, new_c = rewrite("EXTRA_CFLAGS", [
+              ("$(TARGET_CFLAGS)", "$(BB_CLEAN_CFLAGS)"),
+              ("$(TARGET_CPPFLAGS)", "$(BB_CLEAN_CPPFLAGS)"),
+          ])
+          old_l, new_l = rewrite("EXTRA_LDFLAGS", [
+              ("$(TARGET_LDFLAGS)", "$(BB_CLEAN_LDFLAGS)"),
+              ("$(TARGET_CFLAGS)", "$(BB_CLEAN_CFLAGS)"),
+          ])
+          old_b, new_b = rewrite("LDLIBS", [
+              ("$(LDLIBS)", "$(BB_CLEAN_LDLIBS)"),
+          ])
+
+          assert "BB_CLEAN_CFLAGS) $(BB_CLEAN_CPPFLAGS)" in s, \
+              "::error:: busybox EXTRA_CFLAGS 替换失败，拒绝盲目编译"
+          assert 'EXTRA_LDFLAGS="$(BB_CLEAN_LDFLAGS) $(BB_CLEAN_CFLAGS)"' in s, \
+              "::error:: busybox EXTRA_LDFLAGS 替换失败，拒绝盲目编译"
+          assert 'LDLIBS="$(BB_CLEAN_LDLIBS)"' in s, \
+              "::error:: busybox LDLIBS 替换失败，拒绝盲目编译"
+          assert "-Wno-error=deprecated-declarations" in s, \
+              "::error:: -Wno-error 兜底被覆盖，拒绝盲目编译"
           open(p, "w", encoding="utf-8", newline="\n").write(s)
+          print("busybox: EXTRA_CFLAGS=" + new_c)
+          print("busybox: EXTRA_LDFLAGS=" + new_l)
+          print("busybox: LDLIBS=" + new_b)
           print("busybox: 已在传参处用 filter-out 剔除 sanitizer/-O0/-g（不依赖注入源）")
           PY
           echo "=== 复核 busybox 传参（应全是 BB_CLEAN_*）==="
